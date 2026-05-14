@@ -1,0 +1,34 @@
+# البيانات والأسعار
+yfinance
+requests
+python-dotenv
+
+# معالجة البيانات
+pandas
+numpy
+scikit-learn
+pyarrow
+pandas_ta
+scipy
+lightgbm
+optuna
+
+# الذكاء الاصطناعي (PyTorch)
+torch
+torchvision
+torchaudio
+
+# تحليل المشاعر (Sentiment Analysis)
+transformers
+
+# التحليل الفني والرسوم
+matplotlib
+plotly
+
+# أدوات مساعدة
+tqdm
+beautifulsoup4
+lxml
+
+# Dashboard (Hugging Face Spaces)
+gradio

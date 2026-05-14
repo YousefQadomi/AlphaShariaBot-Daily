@@ -1,0 +1,8 @@
+{
+  "initial_balance": 1000.0,
+  "cash": 1000.0,
+  "realized_pnl": 0.0,
+  "positions": [],
+  "trade_history": [],
+  "last_run_date": null
+}

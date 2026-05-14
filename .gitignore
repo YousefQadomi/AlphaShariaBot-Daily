@@ -1,0 +1,33 @@
+# Secrets — NEVER push these
+.env
+
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Large data files
+data/processed/
+data/historical/
+data/sentiment/
+data/macro/
+data/backtest/
+
+# Pickle/model binaries (too large)
+models/*.pkl
+models/*.pth
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test/temp files
+test_*.py
+check_*.py
