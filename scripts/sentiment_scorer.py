@@ -107,6 +107,70 @@ def aggregate_daily(news: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Live/Intraday Scoring — Lightweight Real-Time Mode
+# ═══════════════════════════════════════════════════════════════════════════
+class LiveSentimentScorer:
+    """
+    Singleton-pattern FinBERT scorer for intraday use.
+    Keeps the model loaded in memory across scan cycles.
+    Scores small batches of headlines (1-10) quickly.
+    """
+    _instance = None
+    _scorer = None
+
+    @classmethod
+    def get_instance(cls):
+        """Get or create the singleton scorer."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self._scorer = None
+
+    def _ensure_loaded(self):
+        if self._scorer is None:
+            self._scorer = FinBERTScorer()
+
+    def score_batch(self, texts):
+        """Score a small batch of headlines. Returns numpy array of scores."""
+        self._ensure_loaded()
+        return self._scorer.score_batch(texts)
+
+    def score_single(self, headline, summary=""):
+        """Score a single headline. Returns float in [-1, +1]."""
+        self._ensure_loaded()
+        text = f"{headline}. {summary}" if summary else headline
+        scores = self._scorer.score_batch([text])
+        return float(scores[0])
+
+    def score_recent(self, articles):
+        """
+        Score a list of recent articles for intraday use.
+
+        Args:
+            articles: list of dicts with 'headline' and optional 'summary'
+
+        Returns:
+            list of floats (sentiment scores in [-1, +1])
+        """
+        if not articles:
+            return []
+        self._ensure_loaded()
+        texts = [
+            f"{a.get('headline', '')}. {a.get('summary', '')}"
+            for a in articles
+        ]
+        # Process in small batches (intraday = usually <20 articles)
+        all_scores = []
+        for i in range(0, len(texts), 16):
+            batch = texts[i:i+16]
+            scores = self._scorer.score_batch(batch)
+            all_scores.extend(scores.tolist())
+        return all_scores
+
+
 def main():
     print("🧠 AlphaShariaBot — FinBERT Sentiment Scorer\n")
     if not os.path.exists(RAW_NEWS_PATH):
@@ -140,3 +204,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -56,7 +56,7 @@ log = logging.getLogger("RiskManager")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Default Risk Parameters
+# Default Risk Parameters (Swing Trading — 10-day holds)
 # ═══════════════════════════════════════════════════════════════════════════
 DEFAULT_CONFIG = {
     # ── Stop-Loss ─────────────────────────────────────────────────────
@@ -84,6 +84,46 @@ DEFAULT_CONFIG = {
     "max_drawdown_pct": -0.15,   # -15% drawdown = freeze new buys
     # Resume trading when drawdown recovers above this level
     "resume_drawdown_pct": -0.10,  # resume at -10%
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Intraday Risk Parameters (Day Trading — same-day close)
+# ═══════════════════════════════════════════════════════════════════════════
+INTRADAY_CONFIG = {
+    # ── Per-Trade Risk ────────────────────────────────────────────────
+    "stop_loss_pct": -0.008,            # -0.8% hard stop per trade
+    "trailing_stop_pct": -0.005,        # -0.5% trailing after activation
+    "take_profit_pct": 0.015,           # +1.5% target exit
+    "trailing_activation_pct": 0.005,   # activate trailing after +0.5%
+
+    # ── Daily Risk Limits ─────────────────────────────────────────────
+    "max_daily_loss_pct": -0.03,        # -3% daily loss → halt trading
+    "max_daily_trades": 30,             # cap trades per day
+    "max_consecutive_losses": 5,        # 5 losses in a row → pause
+
+    # ── Position Sizing ───────────────────────────────────────────────
+    "risk_per_trade_pct": 0.01,         # risk 1% of equity per trade
+    "max_position_pct": 0.15,           # max 15% of equity in one stock
+    "max_sector_exposure": 0.40,        # max 40% in one sector
+
+    # ── Volatility Sizing ─────────────────────────────────────────────
+    "target_vol_annual": 0.20,
+    "min_weight": 0.05,
+    "max_weight": 0.25,
+
+    # ── Correlation Guard ─────────────────────────────────────────────
+    "max_correlation": 0.70,
+    "corr_lookback": 60,
+
+    # ── Circuit Breaker (tighter for intraday) ────────────────────────
+    "max_drawdown_pct": -0.05,          # -5% drawdown = freeze
+    "resume_drawdown_pct": -0.03,
+
+    # ── Spread & Cost Guard ───────────────────────────────────────────
+    "max_entry_spread_pct": 0.001,      # skip if spread > 0.1%
+    "min_dollar_volume_1h": 100_000,    # min $ volume in last hour
+    "min_profit_after_costs": 0.002,    # min expected profit after costs
 }
 
 
@@ -466,6 +506,238 @@ class RiskManager:
         log.info(f"  Circuit breaker:       {breaker}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# IntradayRiskManager — Day Trading Risk Controls
+# ═══════════════════════════════════════════════════════════════════════════
+class IntradayRiskManager(RiskManager):
+    """
+    Extended risk manager for intraday (day) trading.
+
+    Adds on top of the base RiskManager:
+      - Per-trade take-profit and trailing stop-loss
+      - Daily loss limit (halt trading if exceeded)
+      - Daily trade counter (prevent overtrading)
+      - Consecutive loss tracker (pause after streak)
+      - Spread / cost guard (skip expensive entries)
+      - Risk-based position sizing (1% risk per trade)
+    """
+
+    def __init__(self, config=None):
+        intraday_cfg = config or INTRADAY_CONFIG.copy()
+        super().__init__(config=intraday_cfg)
+
+        # Daily tracking (reset each morning)
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+        self.consecutive_losses = 0
+        self.daily_halted = False
+        self.start_of_day_equity = 0.0
+
+        log.info(f"  ⚡ Intraday Risk Manager initialized")
+        log.info(f"     Stop-loss:     {self.config['stop_loss_pct']*100:.1f}%")
+        log.info(f"     Take-profit:   {self.config['take_profit_pct']*100:.1f}%")
+        log.info(f"     Daily loss cap: {self.config['max_daily_loss_pct']*100:.1f}%")
+        log.info(f"     Max trades/day: {self.config['max_daily_trades']}")
+
+    def reset_daily(self, equity):
+        """Call at market open to reset daily counters."""
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+        self.consecutive_losses = 0
+        self.daily_halted = False
+        self.start_of_day_equity = equity
+        log.info(f"  🌅 Daily risk counters reset. SOD equity: ${equity:.2f}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Per-Trade Exit Signals
+    # ═══════════════════════════════════════════════════════════════════
+    def check_intraday_exits(self, positions, get_price_fn):
+        """
+        Check all positions for intraday exit signals:
+          1. Hard stop-loss (-0.8%)
+          2. Take-profit (+1.5%)
+          3. Trailing stop (-0.5% from peak, after +0.5% gain)
+
+        Returns: list of (ticker, exit_reason) that should be closed.
+        """
+        sl_pct = self.config["stop_loss_pct"]
+        tp_pct = self.config["take_profit_pct"]
+        trail_pct = self.config.get("trailing_stop_pct", -0.005)
+        trail_act = self.config.get("trailing_activation_pct", 0.005)
+
+        exits = []
+
+        for pos in positions:
+            ticker = pos["ticker"]
+            current_price = get_price_fn(ticker)
+            if current_price is None:
+                continue
+
+            entry_price = pos["entry_price"]
+            pnl_pct = (current_price - entry_price) / entry_price
+
+            # Update peak price
+            peak = pos.get("peak_price", entry_price)
+            peak = max(peak, current_price)
+            pos["peak_price"] = peak
+
+            # 1. Hard stop-loss
+            if pnl_pct <= sl_pct:
+                log.warning(f"  🛑 STOP-LOSS {ticker}: {pnl_pct*100:+.2f}% "
+                           f"(limit: {sl_pct*100:.1f}%)")
+                exits.append((ticker, "stop_loss"))
+                continue
+
+            # 2. Take-profit
+            if pnl_pct >= tp_pct:
+                log.info(f"  🎯 TAKE-PROFIT {ticker}: {pnl_pct*100:+.2f}% "
+                        f"(target: {tp_pct*100:.1f}%)")
+                exits.append((ticker, "take_profit"))
+                continue
+
+            # 3. Trailing stop (only after activation threshold)
+            gain_from_entry = (peak - entry_price) / entry_price
+            if gain_from_entry >= trail_act:
+                dd_from_peak = (current_price - peak) / peak
+                if dd_from_peak <= trail_pct:
+                    log.info(f"  📉 TRAILING STOP {ticker}: "
+                            f"peak gain {gain_from_entry*100:+.1f}% → "
+                            f"now {pnl_pct*100:+.1f}%")
+                    exits.append((ticker, "trailing_stop"))
+
+        return exits
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Daily Risk Limits
+    # ═══════════════════════════════════════════════════════════════════
+    def can_open_new_trade(self):
+        """
+        Check if we are allowed to open a new position.
+        Returns (allowed: bool, reason: str).
+        """
+        if self.daily_halted:
+            return False, "Daily halt active (loss limit reached)"
+
+        max_trades = self.config["max_daily_trades"]
+        if self.daily_trades >= max_trades:
+            return False, f"Max daily trades reached ({max_trades})"
+
+        max_losses = self.config["max_consecutive_losses"]
+        if self.consecutive_losses >= max_losses:
+            return False, f"Consecutive loss limit ({max_losses})"
+
+        if self.circuit_breaker_active:
+            return False, "Circuit breaker active"
+
+        return True, "OK"
+
+    def record_trade_result(self, pnl, equity):
+        """
+        Call after each closed trade to update daily counters.
+        Returns True if trading should continue, False if halted.
+        """
+        self.daily_pnl += pnl
+        self.daily_trades += 1
+
+        if pnl <= 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+
+        # Check daily loss limit
+        if self.start_of_day_equity > 0:
+            daily_return = self.daily_pnl / self.start_of_day_equity
+            max_loss = self.config["max_daily_loss_pct"]
+            if daily_return <= max_loss:
+                self.daily_halted = True
+                log.warning(
+                    f"  🚨 DAILY LOSS LIMIT HIT: {daily_return*100:+.1f}% "
+                    f"(limit: {max_loss*100:.1f}%) — halting all new trades"
+                )
+                return False
+
+        # Update circuit breaker
+        self.update_circuit_breaker(equity)
+        return not self.daily_halted
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Cost-Aware Position Sizing
+    # ═══════════════════════════════════════════════════════════════════
+    def calculate_position_size(self, equity, entry_price, stop_price,
+                                spread_pct=0.0003):
+        """
+        Risk-based position sizing: risk 1% of equity per trade.
+
+        Accounts for:
+          - Distance to stop-loss
+          - Round-trip spread cost
+          - Slippage estimate (0.02%)
+
+        Returns: dollar amount to invest (capped at max_position_pct).
+        """
+        risk_pct = self.config["risk_per_trade_pct"]
+        max_pos = self.config["max_position_pct"]
+
+        risk_amount = equity * risk_pct  # e.g., $1000 * 1% = $10
+        risk_per_share = abs(entry_price - stop_price)
+        spread_cost = entry_price * spread_pct * 2  # round trip
+        slippage = entry_price * 0.0002  # 0.02% estimate
+        total_risk_per_share = risk_per_share + spread_cost + slippage
+
+        if total_risk_per_share <= 0:
+            return 0.0
+
+        shares = risk_amount / total_risk_per_share
+        dollar_amount = shares * entry_price
+
+        # Cap at max position size
+        max_dollar = equity * max_pos
+        dollar_amount = min(dollar_amount, max_dollar)
+
+        # Floor at $1 (Alpaca minimum)
+        return max(1.0, round(dollar_amount, 2))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Spread & Cost Guard
+    # ═══════════════════════════════════════════════════════════════════
+    def passes_spread_check(self, bid, ask, price):
+        """
+        Check if a stock's bid-ask spread is acceptable for entry.
+        Wide spreads eat into profits on intraday trades.
+        """
+        if price <= 0:
+            return False
+        spread = (ask - bid) / price
+        max_spread = self.config.get("max_entry_spread_pct", 0.001)
+        if spread > max_spread:
+            log.debug(f"  Spread too wide: {spread*100:.3f}% > {max_spread*100:.1f}%")
+            return False
+        return True
+
+    def is_trade_profitable(self, expected_return_pct, spread_pct):
+        """
+        Verify expected profit exceeds transaction costs.
+        Prevents entering trades where fees eat all profit.
+        """
+        total_cost = (spread_pct * 2) + 0.0002 + 0.0005  # spread + slip + safety
+        min_profit = self.config.get("min_profit_after_costs", 0.002)
+        return expected_return_pct > max(total_cost, min_profit)
+
+    def intraday_summary(self):
+        """Print intraday risk health report."""
+        log.info(f"\n  ⚡ INTRADAY RISK SUMMARY")
+        log.info(f"  {'─'*45}")
+        daily_ret = (self.daily_pnl / self.start_of_day_equity * 100
+                     if self.start_of_day_equity > 0 else 0)
+        log.info(f"  Daily P&L:         ${self.daily_pnl:+.2f} ({daily_ret:+.1f}%)")
+        log.info(f"  Trades today:      {self.daily_trades}")
+        log.info(f"  Consecutive losses: {self.consecutive_losses}")
+        halted = "🔴 HALTED" if self.daily_halted else "🟢 ACTIVE"
+        log.info(f"  Trading status:    {halted}")
+        breaker = "🔴 ACTIVE" if self.circuit_breaker_active else "🟢 OK"
+        log.info(f"  Circuit breaker:   {breaker}")
+
+
 if __name__ == "__main__":
     # Quick test / config generation
     rm = RiskManager()
@@ -475,3 +747,8 @@ if __name__ == "__main__":
     print(f"\n📋 Current settings:")
     for k, v in rm.config.items():
         print(f"   {k}: {v}")
+
+    print(f"\n📋 Intraday config:")
+    for k, v in INTRADAY_CONFIG.items():
+        print(f"   {k}: {v}")
+
