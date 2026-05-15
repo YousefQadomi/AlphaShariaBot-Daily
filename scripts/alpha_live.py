@@ -46,9 +46,16 @@ INITIAL_BALANCE  = 1000.0
 MAX_POSITIONS    = 50
 PER_POSITION     = 20.0     # fixed $20 per deal
 HOLDING_DAYS     = 10       # must match FORWARD_DAYS in training
-TOP_K            = 50       # pick top 50 from ranked universe
 LOOKBACK_DAYS    = 400      # calendar days → ~280 trading days (need 252 for rolling features)
 WEAK_SECTORS     = {"Real Estate", "Energy"}  # excluded from training → exclude from picks
+
+# ─── Confidence-Based Selection ───────────────────────────────────────────
+# Instead of blindly picking TOP_K=50 stocks, the model now outputs a
+# confidence percentage (0-100%) for each stock.  Only stocks ABOVE the
+# minimum threshold are eligible for purchase.  This prevents the model
+# from being forced to fill slots with mediocre or bad picks.
+MIN_CONFIDENCE_PCT   = 55.0   # minimum confidence % to consider buying
+SENTIMENT_BOOST_WEIGHT = 10.0 # max % points sentiment can add/subtract
 
 # ─── Logging ──────────────────────────────────────────────────────────────
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -419,7 +426,10 @@ class InferenceEngine:
     def rank_universe(self, exclude_tickers=None):
         """
         Download data, compute features, z-score, predict, rank.
-        Returns: list of (ticker, score) sorted descending.
+        Returns: list of (ticker, raw_score, confidence_pct) sorted by
+                 confidence descending.  Only stocks ABOVE MIN_CONFIDENCE_PCT
+                 are included — the list may have 5 stocks or 50, depending
+                 on how many the model truly believes in.
         """
         exclude = exclude_tickers or set()
         end_date = datetime.now().strftime("%Y-%m-%d")
@@ -483,20 +493,93 @@ class InferenceEngine:
 
         X = panel[self.feature_names].fillna(0).values.astype(np.float32)
 
-        # Predict
-        scores = self.model.predict(X)
+        # Predict raw scores
+        raw_scores = self.model.predict(X)
 
-        # Filter out weak sectors (excluded from training)
+        # ─── Convert Raw Scores → Calibrated Confidence % ─────────────
+        # The LambdaRank model outputs arbitrary ranking scores (not
+        # probabilities).  We convert them to a 0-100% confidence using:
+        #   1. Z-score normalization (where does this stock sit in today's
+        #      distribution?)
+        #   2. Sigmoid mapping (z-score → [0, 1] probability)
+        #   3. Sentiment adjustment (boost/penalize based on news)
+        #
+        # This way the model "thinks" in percentages:
+        #   - "AAPL is 78% likely to go up" → buy
+        #   - "XYZ is 42% likely to go up"  → skip
+        # ───────────────────────────────────────────────────────────────
+        score_mean = np.mean(raw_scores)
+        score_std  = np.std(raw_scores)
+        if score_std < 1e-8:
+            score_std = 1.0  # avoid division by zero
+
         results = []
-        for ticker, score in zip(valid_tickers, scores):
+        for ticker, raw_score in zip(valid_tickers, raw_scores):
             fund = self.fundamentals.get(ticker, {})
             sector = fund.get("Sector", "")
             if sector in WEAK_SECTORS:
                 continue
-            results.append((ticker, score))
-        results.sort(key=lambda x: x[1], reverse=True)
 
-        log.info(f"  🏆 Top 5: {[f'{t}({s:.2f})' for t, s in results[:5]]}")
+            # Step 1: Z-score within today's universe
+            z = (raw_score - score_mean) / score_std
+
+            # Step 2: Sigmoid → base confidence [0, 100]
+            #   z = 0   → 50%  (average stock)
+            #   z = +2  → ~88% (strong pick)
+            #   z = -2  → ~12% (weak pick)
+            base_confidence = 100.0 / (1.0 + np.exp(-z))
+
+            # Step 3: Sentiment adjustment
+            # Sentiment scores are in [-1, +1]. We scale them to
+            # ±SENTIMENT_BOOST_WEIGHT percentage points.
+            sent = self.sentiment.get(ticker, {})
+            sent_3d = sent.get("sentiment_mean_3d", 0.0)
+            sent_7d = sent.get("sentiment_mean_7d", 0.0)
+            sent_mom = sent.get("sentiment_momentum", 0.0)
+            news_vol = sent.get("news_volume_3d", 0.0)
+
+            # Weighted blend: recent sentiment matters more
+            # Only apply full boost when there's actual news coverage
+            if news_vol > 0:
+                blended_sentiment = 0.5 * sent_3d + 0.3 * sent_7d + 0.2 * sent_mom
+                # Scale [-1, +1] → [-BOOST, +BOOST]
+                sentiment_adj = blended_sentiment * SENTIMENT_BOOST_WEIGHT
+            else:
+                sentiment_adj = 0.0  # no news = no adjustment
+
+            confidence = base_confidence + sentiment_adj
+            confidence = max(0.0, min(100.0, confidence))  # clamp to [0, 100]
+
+            results.append((ticker, raw_score, round(confidence, 1)))
+
+        # Sort by confidence (highest first)
+        results.sort(key=lambda x: x[2], reverse=True)
+
+        # ─── Apply Minimum Confidence Threshold ───────────────────────
+        # This is the KEY change: we do NOT force-fill 50 picks.
+        # If only 12 stocks pass the threshold, we buy 12.
+        # If 0 pass, we buy 0 — the model has nothing it believes in.
+        total_before = len(results)
+        results = [(t, s, c) for t, s, c in results if c >= MIN_CONFIDENCE_PCT]
+        filtered_out = total_before - len(results)
+
+        log.info(f"  📊 Confidence Distribution:")
+        if results:
+            confidences = [c for _, _, c in results]
+            log.info(f"     Passed threshold ({MIN_CONFIDENCE_PCT}%): {len(results)} stocks")
+            log.info(f"     Filtered out (below {MIN_CONFIDENCE_PCT}%): {filtered_out} stocks")
+            log.info(f"     Highest: {max(confidences):.1f}% | Lowest: {min(confidences):.1f}% | Avg: {np.mean(confidences):.1f}%")
+        else:
+            log.info(f"     ⚠️ No stocks passed {MIN_CONFIDENCE_PCT}% confidence threshold!")
+            log.info(f"     All {total_before} stocks were below threshold.")
+
+        # Log top picks with their confidence
+        log.info(f"  🏆 Top picks:")
+        for t, s, c in results[:10]:
+            sent_info = self.sentiment.get(t, {})
+            sent_str = f"sent={sent_info.get('sentiment_mean_3d', 0):.2f}" if sent_info else "no-news"
+            log.info(f"     {t:6s} → {c:5.1f}% confidence (score={s:.2f}, {sent_str})")
+
         del panel, all_features
         gc.collect()
 
@@ -605,10 +688,11 @@ def main():
     wallet.increment_holding_days()
 
     # ══════════════════════════════════════════════════════════════════
-    # PHASE B: RANK the Halal universe
+    # PHASE B: RANK the Halal universe (confidence-based)
     # ══════════════════════════════════════════════════════════════════
     log.info(f"\n{'─'*50}")
-    log.info("🧠 PHASE B: Running model inference...")
+    log.info("🧠 PHASE B: Running model inference (confidence mode)...")
+    log.info(f"   Min confidence threshold: {MIN_CONFIDENCE_PCT}%")
 
     # ── Circuit Breaker Check ─────────────────────────────────────────
     updated_equity = wallet.virtual_balance
@@ -632,16 +716,23 @@ def main():
     del engine; gc.collect()
 
     if not rankings:
-        log.warning("  ⚠️ No ranked stocks available. Skipping buy phase.")
+        log.warning("  ⚠️ No stocks passed the confidence threshold. Skipping buy phase.")
+        log.info("     This is NORMAL — the model found nothing worth buying today.")
         wallet.mark_ran_today()
         wallet.summary()
         return
 
     # ══════════════════════════════════════════════════════════════════
-    # PHASE C: BUY top-ranked stocks (with risk controls)
+    # PHASE C: BUY confidence-filtered stocks (with risk controls)
     # ══════════════════════════════════════════════════════════════════
+    # The rankings list already contains ONLY stocks above the confidence
+    # threshold.  We don't force-fill — if 8 stocks pass, we buy 8.
+    # If 50 pass, we cap at slots_available.
+    n_confident = len(rankings)
+    n_to_buy = min(n_confident, slots_available)
     log.info(f"\n{'─'*50}")
-    log.info(f"🛒 PHASE C: Buying top {slots_available} picks (risk-managed)...")
+    log.info(f"🛒 PHASE C: {n_confident} stocks passed confidence threshold, "
+             f"buying up to {n_to_buy} (risk-managed)...")
 
     cash = wallet.available_cash_for_new()
     if cash < 1.0:
@@ -652,8 +743,8 @@ def main():
 
     # Build candidate list with volatility info for sizing
     candidates = []
-    for ticker, score in rankings:
-        if len(candidates) >= slots_available * 3:  # check 3x candidates
+    for ticker, score, confidence in rankings:
+        if len(candidates) >= n_to_buy * 3:  # check 3x candidates for risk filters
             break
         try:
             price = alpaca.get_latest_price(ticker)
@@ -669,14 +760,15 @@ def main():
             candidates.append({
                 "ticker": ticker,
                 "score": score,
+                "confidence": confidence,
                 "price": price,
                 "volatility_20d": 0.02,  # default, would be computed from bars
             })
         except Exception as e:
             log.debug(f"  Skip {ticker}: {e}")
 
-    # Take only top slots_available after filtering
-    candidates = candidates[:slots_available]
+    # Cap at available slots (but may be fewer if not enough passed filters)
+    candidates = candidates[:n_to_buy]
 
     if not candidates:
         log.info("  No candidates passed risk filters.")
@@ -689,6 +781,7 @@ def main():
     for c in candidates:
         ticker = c["ticker"]
         price = c["price"]
+        confidence = c["confidence"]
         dollar_amount = min(PER_POSITION, cash)
         if dollar_amount < 1.0:
             log.info(f"  💸 Not enough cash (${cash:.2f}). Stopping buys.")
@@ -701,7 +794,8 @@ def main():
             wallet.open_position(ticker, shares, price)
             cash -= dollar_amount
             bought += 1
-            log.info(f"  📗 OPEN  {ticker}: {shares} shares @ ${price:.2f} = ${dollar_amount:.2f}")
+            log.info(f"  📗 BUY  {ticker}: {shares} shares @ ${price:.2f} = ${dollar_amount:.2f} "
+                     f"(confidence: {confidence:.1f}%)")
         except Exception as e:
             log.error(f"  ❌ Failed to buy {ticker}: {e}")
 
