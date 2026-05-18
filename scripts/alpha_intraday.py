@@ -257,6 +257,11 @@ class AlpacaIntradayClient:
 
     def is_market_open(self):
         clock = self._get(f"{self.base}/v2/clock")
+        log.info(f"  🕐 Alpaca Clock API response:")
+        log.info(f"     is_open:    {clock.get('is_open')}")
+        log.info(f"     timestamp:  {clock.get('timestamp')}")
+        log.info(f"     next_open:  {clock.get('next_open')}")
+        log.info(f"     next_close: {clock.get('next_close')}")
         return clock["is_open"]
 
     def get_latest_price(self, ticker):
@@ -545,12 +550,21 @@ def main():
 
     # ── Market check ──────────────────────────────────────────────────
     try:
-        if not alpaca.is_market_open():
-            log.info("🔒 Market is closed. Nothing to do.")
+        now_et = datetime.now(ET)
+        log.info(f"  🕐 Local ET time: {now_et.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        log.info(f"  🕐 Weekday: {now_et.strftime('%A')} (0=Mon..6=Sun: {now_et.weekday()})")
+        market_open = alpaca.is_market_open()
+        if not market_open:
+            log.info("🔒 Market is closed according to Alpaca. Nothing to do.")
+            log.info("   Possible reasons: weekend, US holiday, or outside 9:30AM-4:00PM ET")
             wallet.summary()
             return
+        else:
+            log.info("✅ Market is OPEN! Proceeding with scan...")
     except Exception as e:
         log.error(f"❌ Cannot reach Alpaca API: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return
 
     # Reset daily counters
