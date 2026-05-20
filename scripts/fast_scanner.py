@@ -370,17 +370,21 @@ class FastScanner:
 
         Parameters
         ----------
-        scored_tickers : list of dict
-            Each dict must have at least ``{"ticker": str, "score": float}``.
-            Typically the output of a scan cycle.
+        scored_tickers : dict or list
+            Either a ``{ticker: score}`` dict, or a list of dicts each
+            containing ``{"ticker": str, "score": float}``.
 
         Keeps the top ``WATCHLIST_MAX_SIZE`` tickers by score across
         the current watchlist and newly scored tickers.
         """
+        # Normalise input: accept dict {ticker: score} or list of dicts
+        if isinstance(scored_tickers, dict):
+            pairs = scored_tickers.items()
+        else:
+            pairs = [(item["ticker"], item["score"]) for item in scored_tickers]
+
         # Merge new scores into existing scores
-        for item in scored_tickers:
-            ticker = item["ticker"]
-            score = item["score"]
+        for ticker, score in pairs:
             # Exponential moving average: blend old/new score
             if ticker in self.watchlist_scores:
                 self.watchlist_scores[ticker] = (
