@@ -74,13 +74,20 @@ def run_script(script_name, extra_args=None):
         slog.error(f"💥 {script_name} error: {e}")
         return False, str(e)
 
+# ─── Load wallet JSON safely ─────────────────────────────────────────────
+def _load_wallet_json():
+    """Load raw wallet dict from disk."""
+    try:
+        with open(WALLET_PATH, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
 # ─── Load wallet data for dashboard ──────────────────────────────────────
 def load_wallet():
     """Load and return intraday wallet state as formatted text."""
-    try:
-        with open(WALLET_PATH, "r") as f:
-            w = json.load(f)
-    except FileNotFoundError:
+    w = _load_wallet_json()
+    if w is None:
         return "No wallet file found. Run the bot first."
 
     lines = []
@@ -115,20 +122,8 @@ def load_wallet():
             lines.append(f"{p['ticker']:<8} {p['shares']:>10.4f} "
                         f"${p['entry_price']:>9.2f} {score:>6.1f}")
 
-    # Recent trades
-    history = w.get("trade_history", [])
-    if history:
-        lines.append(f"\n{'─'*50}")
-        lines.append("RECENT TRADES (last 15):")
-        lines.append(f"{'Ticker':<8} {'PnL':>10} {'Return':>8} {'Reason':>12}")
-        lines.append(f"{'─'*8} {'─'*10} {'─'*8} {'─'*12}")
-        for t in history[-15:]:
-            pnl_str = f"${t['pnl']:+.2f}"
-            ret_str = f"{t.get('return_pct', 0):+.1f}%"
-            reason = t.get("exit_reason", "?")[:12]
-            lines.append(f"{t['ticker']:<8} {pnl_str:>10} {ret_str:>8} {reason:>12}")
-
     # Win rate
+    history = w.get("trade_history", [])
     if history:
         wins = sum(1 for t in history if t["pnl"] > 0)
         total = len(history)
@@ -167,6 +162,81 @@ def load_logs():
     except FileNotFoundError:
         return "No log file found. Run the bot first."
 
+
+# ─── Trade History ───────────────────────────────────────────────────────
+def load_trade_history():
+    """Load trade history from wallet and return as a formatted table string."""
+    w = _load_wallet_json()
+    if w is None:
+        return "No wallet file found. Run the bot first."
+
+    history = w.get("trade_history", [])
+    if not history:
+        return "No trades yet. The bot will log each buy/sell here automatically."
+
+    # Reverse so newest trades appear first
+    history = list(reversed(history))
+
+    # Build header
+    lines = []
+    lines.append(f"{'#':>4}  {'Ticker':<7} {'Action':<13} {'Entry $':>9} {'Exit $':>9} "
+                 f"{'Shares':>9} {'PnL ($)':>10} {'Return':>8} {'Entry Time':<20} {'Exit Time':<20}")
+    lines.append("─" * 130)
+
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+
+    for i, t in enumerate(history, 1):
+        ticker = t.get("ticker", "?")
+        entry_price = t.get("entry_price", 0)
+        exit_price = t.get("exit_price", 0)
+        shares = t.get("shares", 0)
+        pnl = t.get("pnl", 0)
+        ret_pct = t.get("return_pct", 0)
+        reason = t.get("exit_reason", "?")
+        entry_time = t.get("entry_time", "?")
+        exit_time = t.get("exit_time", "?")
+
+        total_pnl += pnl
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+
+        # Color indicator
+        indicator = "✅" if pnl > 0 else ("❌" if pnl < 0 else "➖")
+
+        action = f"{indicator} {reason}"
+
+        lines.append(
+            f"{i:>4}  {ticker:<7} {action:<13} ${entry_price:>8.2f} ${exit_price:>8.2f} "
+            f"{shares:>9.4f} ${pnl:>+9.4f} {ret_pct:>+7.2f}% {entry_time:<20} {exit_time:<20}"
+        )
+
+    # Summary footer
+    total_trades = len(history)
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+    avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
+
+    lines.append("─" * 130)
+    lines.append(f"\n📊 SUMMARY:")
+    lines.append(f"   Total Trades:  {total_trades}")
+    lines.append(f"   Wins:          {wins} ({win_rate:.1f}%)")
+    lines.append(f"   Losses:        {losses} ({100 - win_rate:.1f}%)")
+    lines.append(f"   Total PnL:     ${total_pnl:+.4f}")
+    lines.append(f"   Avg PnL/Trade: ${avg_pnl:+.4f}")
+
+    # Best and worst trades
+    if history:
+        best = max(history, key=lambda t: t.get("pnl", 0))
+        worst = min(history, key=lambda t: t.get("pnl", 0))
+        lines.append(f"\n   🏆 Best Trade:  {best['ticker']} ${best['pnl']:+.4f} ({best.get('return_pct', 0):+.2f}%)")
+        lines.append(f"   💀 Worst Trade: {worst['ticker']} ${worst['pnl']:+.4f} ({worst.get('return_pct', 0):+.2f}%)")
+
+    return "\n".join(lines)
+
+
 # ─── Scheduler State ─────────────────────────────────────────────────────
 scheduler_status = {
     "mode": "INTRADAY",
@@ -176,8 +246,9 @@ scheduler_status = {
     "scans_today": 0,
     "trades_today": 0,
     "last_output": "",
-    "running": True,
+    "running": False,         # Start as stopped — user clicks to start
 }
+_scheduler_thread = None      # Track the background thread
 
 def get_scheduler_status():
     """Return scheduler status as formatted text."""
@@ -197,7 +268,7 @@ def get_scheduler_status():
         f"🔍 Next Scan:             {s['scan_next_run']}",
         f"📰 News Last Poll:        {s['news_last_run']}",
         f"📊 Scans Today:           {s['scans_today']}",
-        f"🔄 Scheduler Active:      {'YES' if s['running'] else 'NO'}",
+        f"🔄 Engine Active:         {'YES ✅' if s['running'] else 'NO ⛔'}",
     ]
     return "\n".join(lines)
 
@@ -276,7 +347,7 @@ def scheduler_loop():
                     slog.info("🔔 EOD Force-close triggered")
                     run_script("alpha_intraday.py", ["--force-close"])
 
-            # ── Weekly halal screener refresh (Sunday midnight or Monday pre-market)
+            # ── Weekly halal screener refresh (Monday pre-market)
             if now.weekday() == 0 and now.hour == 7 and now.minute < 2:
                 slog.info("☪️ Weekly halal universe refresh...")
                 run_script("sharia_screener.py")
@@ -288,6 +359,35 @@ def scheduler_loop():
         except Exception as e:
             slog.error(f"Scheduler error: {e}")
             time.sleep(60)
+
+    slog.info("⛔ Scheduler loop stopped.")
+
+
+# ─── Engine Start / Stop ─────────────────────────────────────────────────
+def toggle_engine():
+    """Start or stop the trading engine."""
+    global _scheduler_thread
+
+    if scheduler_status["running"]:
+        # ── STOP ──
+        scheduler_status["running"] = False
+        slog.info("⛔ Engine STOP requested by user.")
+        return "⛔ Engine STOPPED. Click 'Start Engine' to resume."
+    else:
+        # ── START ──
+        scheduler_status["running"] = True
+        _scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
+        _scheduler_thread.start()
+        slog.info("✅ Engine STARTED by user.")
+        return "✅ Engine STARTED! The bot is now scanning and trading automatically."
+
+
+def get_engine_button_label():
+    """Return the correct button label based on engine state."""
+    if scheduler_status["running"]:
+        return "⛔ Stop Engine"
+    else:
+        return "▶️ Start Engine"
 
 
 # ─── Manual Trigger Functions ────────────────────────────────────────────
@@ -346,6 +446,23 @@ def build_dashboard():
                     interactive=False,
                     every=15,
                 )
+
+                # ── Engine Start/Stop Button (prominent) ──
+                engine_output = gr.Textbox(
+                    label="Engine Status",
+                    lines=2,
+                    interactive=False,
+                    value="⛔ Engine is STOPPED. Click 'Start Engine' to begin automatic trading.",
+                )
+                engine_btn = gr.Button(
+                    "▶️ Start Engine",
+                    variant="primary",
+                    size="lg",
+                )
+                engine_btn.click(toggle_engine, outputs=engine_output)
+
+                gr.Markdown("---")
+                gr.Markdown("### Manual Controls")
                 with gr.Row():
                     scan_btn = gr.Button("🔍 Run Scan Now", variant="primary")
                     close_btn = gr.Button("🔔 Force-Close All",
@@ -360,7 +477,24 @@ def build_dashboard():
                 close_btn.click(manual_force_close, outputs=output_display)
                 sent_btn.click(manual_run_sentiment, outputs=output_display)
 
-            # Tab 3: Risk Config
+            # Tab 3: Trade History (NEW!)
+            with gr.Tab("📜 Trade History"):
+                gr.Markdown("### All Buy/Sell Operations & P&L")
+                gr.Markdown("Every completed trade is logged here with entry/exit "
+                            "prices, shares, profit/loss, and the reason for exit.")
+                history_display = gr.Textbox(
+                    label="Trade History",
+                    value=load_trade_history,
+                    lines=35,
+                    interactive=False,
+                    every=30,  # refresh every 30 sec
+                )
+                history_refresh_btn = gr.Button("🔄 Refresh History",
+                                                variant="secondary")
+                history_refresh_btn.click(load_trade_history,
+                                         outputs=history_display)
+
+            # Tab 4: Risk Config
             with gr.Tab("🛡️ Risk"):
                 risk_display = gr.Textbox(
                     label="Risk Configuration",
@@ -369,8 +503,8 @@ def build_dashboard():
                     interactive=False,
                 )
 
-            # Tab 4: Logs
-            with gr.Tab("📜 Logs"):
+            # Tab 5: Logs
+            with gr.Tab("📋 Logs"):
                 log_display = gr.Textbox(
                     label="Recent Trading Logs",
                     value=load_logs,
@@ -384,12 +518,10 @@ def build_dashboard():
 
 # ─── Main ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Start the background scheduler in a daemon thread
-    scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
-    scheduler_thread.start()
     slog.info("⚡ Starting Intraday Gradio dashboard...")
+    slog.info("   Engine is STOPPED. Use the dashboard to start it.")
 
-    # Launch the Gradio app
+    # Launch the Gradio app (engine starts when user clicks "Start Engine")
     app = build_dashboard()
     app.launch(
         server_name="0.0.0.0",
