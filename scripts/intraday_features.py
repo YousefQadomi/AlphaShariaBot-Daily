@@ -4,7 +4,8 @@ intraday_features.py — Intraday Feature Engineering for Day Trading
 Computes features from 5-minute bars for intraday trading signals.
 
 Key features: VWAP deviation, Opening Range Breakout, Relative Volume,
-Intraday momentum, RSI/MACD on 5-min bars, Session context.
+Intraday momentum, RSI/MACD on 5-min bars, Session context,
+Gap detection, Microstructure analysis.
 
 Usage:
     from intraday_features import IntradayFeatureEngine
@@ -14,6 +15,8 @@ Usage:
 
 import numpy as np
 import pandas as pd
+
+# pyrefly: ignore [missing-import]
 import pandas_ta as ta
 import logging
 from datetime import datetime, timedelta
@@ -38,27 +41,42 @@ class IntradayFeatureEngine:
         start = end - timedelta(days=lookback_days + 2)
         start_str = start.strftime("%Y-%m-%dT09:30:00Z")
         end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-        try:
-            url = (f"{self.alpaca.DATA_URL}/v2/stocks/{ticker}/bars"
-                   f"?timeframe=5Min&start={start_str}&end={end_str}"
-                   f"&limit=10000&feed=iex&adjustment=raw")
-            data = self.alpaca._get(url)
-            bars = data.get("bars", [])
-            if not bars:
+
+        # Retry with backoff for 429 rate limit errors
+        import time as _time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                url = (f"{self.alpaca.DATA_URL}/v2/stocks/{ticker}/bars"
+                       f"?timeframe=5Min&start={start_str}&end={end_str}"
+                       f"&limit=10000&feed=iex&adjustment=raw")
+                data = self.alpaca._get(url)
+                bars = data.get("bars", [])
+                if not bars:
+                    return pd.DataFrame()
+                df = pd.DataFrame(bars)
+                df["t"] = pd.to_datetime(df["t"])
+                df = df.rename(columns={"t": "datetime", "o": "open", "h": "high",
+                                        "l": "low", "c": "close", "v": "volume",
+                                        "vw": "vwap"})
+                df = df.set_index("datetime")[["open", "high", "low", "close",
+                                               "volume", "vwap"]]
+                # Convert UTC -> ET before stripping timezone
+                # (fixes bug where today's bars were missed due to UTC dates)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_convert(ET).tz_localize(None)
+                else:
+                    df.index = df.index.tz_localize(None)
+                df.sort_index(inplace=True)
+                return df
+            except Exception as e:
+                if "429" in str(e) and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)  # 2s, 4s
+                    log.debug(f"  Rate limited on {ticker}, retrying in {wait}s...")
+                    _time.sleep(wait)
+                    continue
+                log.warning(f"  5-min bars failed for {ticker}: {e}")
                 return pd.DataFrame()
-            df = pd.DataFrame(bars)
-            df["t"] = pd.to_datetime(df["t"])
-            df = df.rename(columns={"t": "datetime", "o": "open", "h": "high",
-                                    "l": "low", "c": "close", "v": "volume",
-                                    "vw": "vwap"})
-            df = df.set_index("datetime")[["open", "high", "low", "close",
-                                           "volume", "vwap"]]
-            df.index = df.index.tz_localize(None)
-            df.sort_index(inplace=True)
-            return df
-        except Exception as e:
-            log.warning(f"  5-min bars failed for {ticker}: {e}")
-            return pd.DataFrame()
 
     def _compute_vwap_features(self, df_today):
         """VWAP deviation — the #1 intraday signal."""
@@ -119,43 +137,87 @@ class IntradayFeatureEngine:
                 "momentum_36bar": safe(m36), "momentum_accel": safe(accel)}
 
     def _compute_technicals(self, df_5m):
-        """RSI, MACD, Stoch, ADX, BB, EMA, ATR on 5-min bars."""
-        defaults = {"rsi_14": 50.0, "macd_hist": 0.0, "stoch_k": 50.0,
-                     "adx_14": 20.0, "bb_position": 0.0, "ema_9_dist": 0.0,
-                     "ema_21_dist": 0.0, "atr_pct": 0.02}
+        """RSI, MACD, Stoch, ADX, BB, EMA, ATR on 5-min bars.
+        Optimized: pre-slice close/high/low once, use try/except blocks."""
+        defaults = {"rsi_14": 50.0, "macd_hist": 0.0, "macd_hist_prev": 0.0,
+                     "stoch_k": 50.0, "adx_14": 20.0, "bb_position": 0.0,
+                     "ema_9_dist": 0.0, "ema_21_dist": 0.0,
+                     "ema_9_above_21": 0, "atr_pct": 0.02}
         if len(df_5m) < 30:
             return defaults
-        c, h, lo = df_5m["close"], df_5m["high"], df_5m["low"]
+
+        # Pre-compute slices once (optimization: avoid repeated column access)
+        c = df_5m["close"]
+        h = df_5m["high"]
+        lo = df_5m["low"]
+        last_close = c.iloc[-1]
         feat = {}
-        rsi = ta.rsi(c, length=14)
-        feat["rsi_14"] = round(float(rsi.iloc[-1] if rsi is not None and not rsi.empty else 50), 2)
-        macd = ta.macd(c, fast=12, slow=26, signal=9)
-        if macd is not None and "MACDh_12_26_9" in macd.columns:
-            v = macd["MACDh_12_26_9"].iloc[-1]
-            feat["macd_hist"] = round(float(v / c.iloc[-1] if not np.isnan(v) else 0), 6)
-        else:
+
+        # RSI
+        try:
+            rsi = ta.rsi(c, length=14)
+            feat["rsi_14"] = round(float(rsi.iloc[-1]), 2)
+        except Exception:
+            feat["rsi_14"] = 50.0
+
+        # MACD (current + previous histogram for trend detection)
+        try:
+            macd = ta.macd(c, fast=12, slow=26, signal=9)
+            hist_col = "MACDh_12_26_9"
+            v = macd[hist_col].iloc[-1]
+            feat["macd_hist"] = round(float(v / last_close if not np.isnan(v) else 0), 6)
+            v_prev = macd[hist_col].iloc[-2] if len(macd) >= 2 else 0
+            feat["macd_hist_prev"] = round(float(v_prev / last_close if not np.isnan(v_prev) else 0), 6)
+        except Exception:
             feat["macd_hist"] = 0.0
-        stoch = ta.stoch(h, lo, c)
-        feat["stoch_k"] = round(float(stoch["STOCHk_14_3_3"].iloc[-1] or 50), 2) if stoch is not None and "STOCHk_14_3_3" in stoch.columns else 50.0
-        adx_df = ta.adx(h, lo, c, length=14)
-        feat["adx_14"] = round(float(adx_df["ADX_14"].iloc[-1] or 20), 2) if adx_df is not None and "ADX_14" in adx_df.columns else 20.0
-        bb = ta.bbands(c, length=20, std=2)
-        if bb is not None:
+            feat["macd_hist_prev"] = 0.0
+
+        # Stochastic
+        try:
+            stoch = ta.stoch(h, lo, c)
+            feat["stoch_k"] = round(float(stoch["STOCHk_14_3_3"].iloc[-1] or 50), 2)
+        except Exception:
+            feat["stoch_k"] = 50.0
+
+        # ADX (cached via single computation)
+        try:
+            adx_df = ta.adx(h, lo, c, length=14)
+            feat["adx_14"] = round(float(adx_df["ADX_14"].iloc[-1] or 20), 2)
+        except Exception:
+            feat["adx_14"] = 20.0
+
+        # Bollinger Bands
+        try:
+            bb = ta.bbands(c, length=20, std=2)
             bbu = [x for x in bb.columns if "BBU" in x]
             bbl = [x for x in bb.columns if "BBL" in x]
-            if bbu and bbl:
-                u, l = bb[bbu[0]].iloc[-1], bb[bbl[0]].iloc[-1]
-                feat["bb_position"] = round(float((c.iloc[-1] - l) / (u - l) * 2 - 1 if u != l else 0), 4)
-            else:
-                feat["bb_position"] = 0.0
-        else:
+            u, l = bb[bbu[0]].iloc[-1], bb[bbl[0]].iloc[-1]
+            feat["bb_position"] = round(float((last_close - l) / (u - l) * 2 - 1 if u != l else 0), 4)
+        except Exception:
             feat["bb_position"] = 0.0
-        ema9 = ta.ema(c, length=9)
-        ema21 = ta.ema(c, length=21)
-        feat["ema_9_dist"] = round(float((c.iloc[-1] - ema9.iloc[-1]) / c.iloc[-1]), 6) if ema9 is not None and not ema9.empty else 0.0
-        feat["ema_21_dist"] = round(float((c.iloc[-1] - ema21.iloc[-1]) / c.iloc[-1]), 6) if ema21 is not None and not ema21.empty else 0.0
-        atr = ta.atr(h, lo, c, length=14)
-        feat["atr_pct"] = round(float(atr.iloc[-1] / c.iloc[-1] if atr is not None and not atr.empty and not np.isnan(atr.iloc[-1]) else 0.02), 6)
+
+        # EMAs (9 and 21) + crossover detection
+        try:
+            ema9 = ta.ema(c, length=9)
+            ema21 = ta.ema(c, length=21)
+            ema9_val = ema9.iloc[-1]
+            ema21_val = ema21.iloc[-1]
+            feat["ema_9_dist"] = round(float((last_close - ema9_val) / last_close), 6)
+            feat["ema_21_dist"] = round(float((last_close - ema21_val) / last_close), 6)
+            feat["ema_9_above_21"] = 1 if ema9_val > ema21_val else 0
+        except Exception:
+            feat["ema_9_dist"] = 0.0
+            feat["ema_21_dist"] = 0.0
+            feat["ema_9_above_21"] = 0
+
+        # ATR
+        try:
+            atr = ta.atr(h, lo, c, length=14)
+            atr_val = atr.iloc[-1]
+            feat["atr_pct"] = round(float(atr_val / last_close if not np.isnan(atr_val) else 0.02), 6)
+        except Exception:
+            feat["atr_pct"] = 0.02
+
         return feat
 
     def _session_context(self):
@@ -187,6 +249,121 @@ class IntradayFeatureEngine:
                 "vol_ratio": round(float(np.clip(vr, 0, 5) if not np.isnan(vr) else 1.0), 4),
                 "hl_range_pct": sf(hlr, 0.01)}
 
+    def _compute_gap_features(self, df_5m, df_today):
+        """Detect pre-market gap and gap continuation.
+
+        Compares today's open to the previous trading day's close to detect
+        gap-ups/downs and whether price is continuing or filling the gap.
+
+        Returns:
+            dict with gap_pct, gap_fill_pct, gap_continuation
+        """
+        defaults = {"gap_pct": 0.0, "gap_fill_pct": 0.0, "gap_continuation": 0}
+        if df_today.empty or len(df_today) < 3 or len(df_5m) < MIN_BARS_5M + 3:
+            return defaults
+
+        try:
+            today_date = df_today.index[0].date()
+            # Get previous day's bars (all bars before today)
+            prev_days = df_5m[df_5m.index.date < today_date]
+            if prev_days.empty:
+                return defaults
+
+            yesterday_close = prev_days["close"].iloc[-1]
+            today_open = df_today["open"].iloc[0]
+            current_price = df_today["close"].iloc[-1]
+
+            if yesterday_close <= 0:
+                return defaults
+
+            # Gap percentage: positive = gap up, negative = gap down
+            gap_pct = (today_open - yesterday_close) / yesterday_close
+
+            # Gap fill percentage: 0 = no fill, 1 = fully filled, >1 = overfilled
+            if abs(gap_pct) < 0.001:
+                # Negligible gap
+                gap_fill_pct = 0.0
+            else:
+                gap_size = today_open - yesterday_close
+                fill_amount = today_open - current_price  # how much has reverted
+                gap_fill_pct = fill_amount / gap_size if gap_size != 0 else 0.0
+                gap_fill_pct = float(np.clip(gap_fill_pct, -0.5, 2.0))
+
+            # Gap continuation: +1 if price moving further in gap direction
+            #                   -1 if price reversing (filling gap)
+            #                    0 if no significant gap
+            if abs(gap_pct) < 0.002:
+                gap_continuation = 0
+            elif gap_pct > 0:
+                # Gap up: continuation if price above open, reversal if below
+                gap_continuation = 1 if current_price > today_open else -1
+            else:
+                # Gap down: continuation if price below open, reversal if above
+                gap_continuation = 1 if current_price < today_open else -1
+
+            return {
+                "gap_pct": round(float(gap_pct), 6),
+                "gap_fill_pct": round(float(gap_fill_pct), 4),
+                "gap_continuation": int(gap_continuation),
+            }
+        except Exception:
+            return defaults
+
+    def _compute_microstructure(self, df_today):
+        """Intrabar price action features.
+
+        Analyzes bar-level price action to detect buying/selling pressure:
+        - bar_range_avg: average (high-low)/close of recent bars (volatility proxy)
+        - close_position_in_bar: where close sits in each bar's range (0=low, 1=high)
+          Consistently closing near highs = buying pressure
+        - consecutive_up_bars: count of consecutive bars where close > open
+          (momentum continuation signal)
+        """
+        defaults = {"bar_range_avg": 0.0, "close_position_in_bar": 0.5,
+                     "consecutive_up_bars": 0}
+        if df_today.empty or len(df_today) < 6:
+            return defaults
+
+        try:
+            recent = df_today.tail(12)  # last ~1 hour of bars
+            highs = recent["high"].values
+            lows = recent["low"].values
+            closes = recent["close"].values
+            opens = recent["open"].values
+
+            # Average bar range as percentage of close
+            bar_ranges = (highs - lows) / np.where(closes > 0, closes, 1.0)
+            bar_range_avg = float(np.nanmean(bar_ranges))
+
+            # Where does close sit within each bar's range? (0 = at low, 1 = at high)
+            bar_widths = highs - lows
+            close_positions = np.where(
+                bar_widths > 0,
+                (closes - lows) / bar_widths,
+                0.5  # doji bar
+            )
+            # Weight recent bars more heavily (exponential decay)
+            n = len(close_positions)
+            weights = np.exp(np.linspace(-1.0, 0.0, n))
+            weights /= weights.sum()
+            close_position_avg = float(np.average(close_positions, weights=weights))
+
+            # Count consecutive up bars from the most recent bar backwards
+            consecutive_up = 0
+            for i in range(len(closes) - 1, -1, -1):
+                if closes[i] > opens[i]:
+                    consecutive_up += 1
+                else:
+                    break
+
+            return {
+                "bar_range_avg": round(bar_range_avg, 6),
+                "close_position_in_bar": round(close_position_avg, 4),
+                "consecutive_up_bars": int(consecutive_up),
+            }
+        except Exception:
+            return defaults
+
     def build_features(self, ticker):
         """Build complete intraday feature set. Returns dict or None."""
         df_5m = self._get_5min_bars(ticker)
@@ -205,45 +382,226 @@ class IntradayFeatureEngine:
         features.update(self._compute_technicals(df_5m))
         features.update(self._session_context())
         features.update(self._intraday_volatility(df_5m))
+        features.update(self._compute_gap_features(df_5m, df_today))
+        features.update(self._compute_microstructure(df_today))
+        # Ensure atr_pct is always in output (already set by _compute_technicals)
+        if "atr_pct" not in features:
+            features["atr_pct"] = 0.02
         return features
 
     def compute_entry_score(self, features, catalyst_score=0.0):
         """
-        Rule-based entry scoring [0, 100]. Used until intraday model is trained.
-        Breakdown: VWAP(25) + Momentum(20) + Volume(15) + ORB(15) + Tech(15) + News(10)
-        Minimum to enter: 55
+        Improved rule-based entry scoring [0, 100].
+        Breakdown:
+          VWAP alignment:    0-20 (above VWAP with positive slope = bullish)
+          Momentum:          0-20 (multi-timeframe agreement)
+          Volume:            0-15 (relative volume + surge detection)
+          ORB:               0-10 (opening range breakout)
+          Technical:         0-15 (RSI, MACD, EMA alignment, BB position)
+          News catalyst:     0-10 (from news fetcher)
+          Gap analysis:      0-10 (pre-market gap continuation)
+
+        Session adjustments:
+          - Opening 30 min: +5 bonus (best opportunity window)
+          - Power hour (3-3:45 PM): +3 bonus
+          - Midday (11:30-2:00): -5 penalty (low volume, choppy)
+          - Last 15 min: score = 0 (no new entries)
+
+        Returns:
+            (score, details_dict) where details_dict includes component scores
+            and atr_pct for position sizing.
         """
+        empty_details = {
+            "vwap_score": 0, "momentum_score": 0, "volume_score": 0,
+            "orb_score": 0, "technical_score": 0, "catalyst_score_out": 0,
+            "gap_score": 0, "session_adj": 0, "atr_pct": 0.02,
+        }
         if features is None:
-            return 0.0
-        score = 0.0
-        # VWAP alignment (0-25)
+            return (0.0, empty_details)
+
+        # ── VWAP Alignment (0-20) ──────────────────────────────────────
+        vwap_score = 0.0
         vd = features.get("vwap_deviation", 0)
         vs = features.get("vwap_slope", 0)
-        if vd > 0: score += min(15, vd * 1500)
-        if vs > 0: score += min(10, vs * 5000)
-        # Momentum (0-20)
+        if vd > 0:
+            # Above VWAP: scale up to 12 pts (stronger for larger deviation)
+            vwap_score += min(12, vd * 1200)
+        else:
+            # Below VWAP: penalty (not zero — being below VWAP is bearish)
+            vwap_score += max(-5, vd * 500)
+
+        if vs > 0:
+            # VWAP slope positive = uptrend confirmation
+            vwap_score += min(8, vs * 4000)
+        else:
+            # Negative slope = trend weakening
+            vwap_score += max(-3, vs * 1500)
+        vwap_score = max(0, min(20, vwap_score))
+
+        # ── Momentum — Multi-timeframe Agreement (0-20) ───────────────
+        momentum_score = 0.0
+        m6 = features.get("momentum_6bar", 0)
         m12 = features.get("momentum_12bar", 0)
+        m36 = features.get("momentum_36bar", 0)
         ma = features.get("momentum_accel", 0)
-        if m12 > 0: score += min(12, m12 * 800)
-        if ma > 0: score += min(8, ma * 2000)
-        # Volume (0-15)
+
+        # Both short-term timeframes must agree (noise reduction)
+        if m6 > 0 and m12 > 0:
+            # Multi-timeframe agreement: strong signal
+            agreement_strength = min(m6, m12)  # limited by weaker signal
+            momentum_score += min(12, agreement_strength * 1000)
+            # Bonus if 36-bar also agrees (triple alignment)
+            if m36 > 0:
+                momentum_score += min(4, m36 * 200)
+        elif m6 > 0 or m12 > 0:
+            # Single timeframe only: weak signal (noise)
+            single_m = max(m6, m12)
+            momentum_score += min(4, single_m * 300)
+
+        # Acceleration bonus (momentum increasing)
+        if ma > 0:
+            momentum_score += min(4, ma * 1500)
+        momentum_score = max(0, min(20, momentum_score))
+
+        # ── Volume (0-15) ─────────────────────────────────────────────
+        volume_score = 0.0
         rv = features.get("relative_volume", 1.0)
-        if rv > 1.5: score += min(10, (rv - 1) * 10)
-        if features.get("volume_surge", 0): score += 5
-        # ORB (0-15)
-        if features.get("orb_breakout", 0) == 1: score += 10
+        if rv > 2.0:
+            # Strong relative volume: very significant
+            volume_score += min(10, (rv - 1.0) * 5)
+        elif rv > 1.5:
+            # Moderate: somewhat significant
+            volume_score += min(6, (rv - 1.0) * 6)
+        elif rv > 1.2:
+            # Slightly above average
+            volume_score += min(3, (rv - 1.0) * 10)
+
+        # Volume surge (sustained elevated volume) weighted higher
+        if features.get("volume_surge", 0):
+            volume_score += 7
+        volume_score = max(0, min(15, volume_score))
+
+        # ── ORB — Opening Range Breakout (0-10) ──────────────────────
+        orb_score = 0.0
+        if features.get("orb_breakout", 0) == 1:
+            orb_score += 7
         op = features.get("orb_position", 0)
-        if op > 0.5: score += min(5, op * 5)
-        # Technicals (0-15)
+        if op > 0.5:
+            orb_score += min(3, op * 2.5)
+        orb_score = max(0, min(10, orb_score))
+
+        # ── Technicals (0-15) ────────────────────────────────────────
+        tech_score = 0.0
+
+        # RSI sweet spot: 45-65 is ideal for momentum entries
         rsi = features.get("rsi_14", 50)
-        if 40 < rsi < 70: score += 5
-        if features.get("macd_hist", 0) > 0: score += 4
-        if features.get("ema_9_dist", 0) > 0: score += 3
+        if 45 <= rsi <= 65:
+            # Sweet spot: full points
+            tech_score += 4
+        elif 35 <= rsi < 45:
+            # Slightly oversold, could bounce
+            tech_score += 2
+        elif 65 < rsi <= 75:
+            # Getting overbought, reduced score
+            tech_score += 1
+        # RSI > 75 or < 35: 0 points (extremes are risky for new entries)
+
+        # MACD histogram: positive AND increasing = strong
+        macd_h = features.get("macd_hist", 0)
+        macd_h_prev = features.get("macd_hist_prev", 0)
+        if macd_h > 0:
+            tech_score += 2
+            if macd_h > macd_h_prev:
+                # Histogram increasing = momentum accelerating
+                tech_score += 2
+        elif macd_h < 0 and macd_h > macd_h_prev:
+            # Negative but improving = potential reversal, small credit
+            tech_score += 1
+
+        # EMA crossover: EMA 9 > EMA 21 = bullish structure
+        if features.get("ema_9_above_21", 0):
+            tech_score += 3
+        # Price above EMA 9 = immediate trend confirmation
+        if features.get("ema_9_dist", 0) > 0:
+            tech_score += 1
+
+        # Bollinger Band position: near middle-upper is ideal
         bp = features.get("bb_position", 0)
-        if -0.5 < bp < 0.7: score += 3
-        # News catalyst (0-10)
-        score += min(10, catalyst_score * 10)
-        # Session penalties
-        if features.get("is_midday", 0): score *= 0.85
-        if features.get("minutes_to_close", 390) < 30: score *= 0.5
-        return round(min(100, max(0, score)), 1)
+        if 0.0 < bp < 0.6:
+            tech_score += 2
+        elif -0.3 < bp <= 0.0:
+            tech_score += 1
+        tech_score = max(0, min(15, tech_score))
+
+        # ── News Catalyst (0-10) ─────────────────────────────────────
+        cat_score = min(10, catalyst_score * 10)
+
+        # ── Gap Analysis (0-10) ──────────────────────────────────────
+        gap_score = 0.0
+        gap_pct = features.get("gap_pct", 0)
+        gap_cont = features.get("gap_continuation", 0)
+        gap_fill = features.get("gap_fill_pct", 0)
+
+        if gap_pct > 0.01 and gap_cont == 1:
+            # Gap up with continuation = strong bullish
+            gap_score += min(7, gap_pct * 300)
+            # Less fill = stronger continuation
+            if gap_fill < 0.3:
+                gap_score += 3
+        elif gap_pct > 0.005 and gap_cont == 1:
+            # Small gap up with continuation
+            gap_score += min(4, gap_pct * 200)
+        elif gap_pct < -0.01 and gap_cont == -1:
+            # Gap down reversing (filling up) = potential long
+            gap_score += min(4, abs(gap_pct) * 150)
+        gap_score = max(0, min(10, gap_score))
+
+        # ── Raw score (pre-session) ──────────────────────────────────
+        raw_score = (vwap_score + momentum_score + volume_score +
+                     orb_score + tech_score + cat_score + gap_score)
+
+        # ── Session Adjustments ──────────────────────────────────────
+        session_adj = 0.0
+        mins_open = features.get("minutes_since_open", 195)
+        mins_close = features.get("minutes_to_close", 195)
+
+        # Last 15 minutes: NO new entries (forced zero)
+        if mins_close < 15:
+            details = {
+                "vwap_score": round(vwap_score, 1),
+                "momentum_score": round(momentum_score, 1),
+                "volume_score": round(volume_score, 1),
+                "orb_score": round(orb_score, 1),
+                "technical_score": round(tech_score, 1),
+                "catalyst_score_out": round(cat_score, 1),
+                "gap_score": round(gap_score, 1),
+                "session_adj": -999,
+                "atr_pct": features.get("atr_pct", 0.02),
+            }
+            return (0.0, details)
+
+        # Opening 30 minutes: best opportunity window
+        if mins_open < 30:
+            session_adj += 5
+        # Power hour: 3:00-3:45 PM (330-375 mins since open)
+        elif 330 <= mins_open <= 375:
+            session_adj += 3
+        # Midday lull: 11:30 AM - 2:00 PM (120-270 mins since open)
+        elif 120 < mins_open < 270:
+            session_adj -= 5
+
+        final_score = round(min(100, max(0, raw_score + session_adj)), 1)
+
+        details = {
+            "vwap_score": round(vwap_score, 1),
+            "momentum_score": round(momentum_score, 1),
+            "volume_score": round(volume_score, 1),
+            "orb_score": round(orb_score, 1),
+            "technical_score": round(tech_score, 1),
+            "catalyst_score_out": round(cat_score, 1),
+            "gap_score": round(gap_score, 1),
+            "session_adj": round(session_adj, 1),
+            "atr_pct": features.get("atr_pct", 0.02),
+        }
+
+        return (final_score, details)

@@ -23,7 +23,9 @@ import logging
 import requests
 import numpy as np
 import pandas as pd
+# pyrefly: ignore [missing-import]
 import pandas_ta as ta
+# pyrefly: ignore [missing-import]
 import lightgbm as lgb
 from datetime import datetime, timedelta
 from dotenv import load_dotenv

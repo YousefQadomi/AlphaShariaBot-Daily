@@ -148,7 +148,16 @@ class IntradayNewsFetcher:
                 except Exception:
                     sentiment = direction * 0.5
             else:
-                sentiment = direction * 0.5
+                # Use Alpaca's built-in sentiment if available (secondary source)
+                alpaca_sentiment = item.get("sentiment")
+                if alpaca_sentiment == "positive":
+                    sentiment = max(direction * 0.5, 0.4)
+                elif alpaca_sentiment == "negative":
+                    sentiment = min(direction * 0.5, -0.4)
+                elif alpaca_sentiment == "neutral":
+                    sentiment = direction * 0.2
+                else:
+                    sentiment = direction * 0.5
 
             for ticker in symbols:
                 ticker = ticker.upper()
@@ -235,6 +244,33 @@ class IntradayNewsFetcher:
         }
 
         return round(float(score), 4), details
+
+    def get_urgent_tickers(self, threshold=0.5):
+        """
+        Return tickers with breaking/urgent news that warrant an immediate scan.
+        Used for news-driven fast entry — when a high-urgency headline hits,
+        the engine triggers an immediate mini-scan instead of waiting for the
+        next scheduled cycle.
+
+        Args:
+            threshold: minimum catalyst score to be considered urgent
+
+        Returns:
+            list of ticker strings that have urgent news
+        """
+        urgent = []
+        now = time.time()
+        for ticker, entries in self.news_buffer.items():
+            # Only consider very recent news (last 5 minutes)
+            recent = [e for e in entries if now - e["timestamp"] < 300]
+            if not recent:
+                continue
+            # Check for high urgency
+            max_urgency = max(e["urgency"] for e in recent)
+            avg_sentiment = np.mean([e["sentiment"] for e in recent])
+            if max_urgency >= threshold and avg_sentiment > 0:
+                urgent.append(ticker)
+        return urgent
 
     def get_sector_momentum(self, sector_tickers):
         """

@@ -1,0 +1,39 @@
+{
+  "target": "target_30m",
+  "target_config": {
+    "forward_bars": 6,
+    "min_gain": 0.005
+  },
+  "train_rows": 202881,
+  "test_rows": 61373,
+  "train_positive_rate": 0.1678,
+  "test_positive_rate": 0.1996,
+  "auc": 0.7924,
+  "precision_at_optimal": 0.414,
+  "recall_at_optimal": 0.6635,
+  "f1_at_optimal": 0.5099,
+  "top_10pct_precision": 0.5783,
+  "top_10pct_win_rate": 0.5783,
+  "optimal_threshold": 0.4,
+  "num_trees": 470,
+  "num_features": 22,
+  "scale_pos_weight": "2.23",
+  "best_params": {
+    "learning_rate": 0.020266443296516192,
+    "num_leaves": 49,
+    "max_depth": 4,
+    "min_data_in_leaf": 887,
+    "feature_fraction": 0.7261399009614654,
+    "bagging_fraction": 0.9343737427379251,
+    "bagging_freq": 6,
+    "lambda_l1": 7.112294948865141,
+    "lambda_l2": 7.780689358866259,
+    "objective": "binary",
+    "metric": "auc",
+    "verbosity": -1,
+    "seed": 42,
+    "scale_pos_weight": "2.2270443",
+    "feature_pre_filter": false
+  },
+  "trained_at": "2026-05-20T17:49:02.435078"
+}

@@ -20,8 +20,11 @@ import gc
 import json
 import numpy as np
 import pandas as pd
+# pyrefly: ignore [missing-import]
 import lightgbm as lgb
+# pyrefly: ignore [missing-import]
 import optuna
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
     roc_auc_score, precision_score, recall_score, f1_score

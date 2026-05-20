@@ -46,6 +46,7 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ─── Paths ────────────────────────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,11 +92,28 @@ DEFAULT_CONFIG = {
 # Intraday Risk Parameters (Day Trading — same-day close)
 # ═══════════════════════════════════════════════════════════════════════════
 INTRADAY_CONFIG = {
-    # ── Per-Trade Risk ────────────────────────────────────────────────
-    "stop_loss_pct": -0.008,            # -0.8% hard stop per trade
+    # ── ATR-Based Dynamic Stop-Loss ──────────────────────────────────
+    "stop_loss_atr_multiplier": 1.5,    # stop = entry - (multiplier * ATR)
+    "stop_loss_min_pct": -0.025,         # floor: never wider than -2.5%
+    "stop_loss_max_pct": -0.005,         # ceiling: never tighter than -0.5%
+    "stop_loss_fallback_pct": -0.012,    # used when ATR unavailable (-1.2%)
+
+    # ── Legacy stop (kept for config completeness) ───────────────────
+    "stop_loss_pct": -0.012,            # matches fallback; used by base class
+
+    # ── Trailing Stop ────────────────────────────────────────────────
     "trailing_stop_pct": -0.005,        # -0.5% trailing after activation
-    "take_profit_pct": 0.015,           # +1.5% target exit
     "trailing_activation_pct": 0.005,   # activate trailing after +0.5%
+
+    # ── Scaling Exits ────────────────────────────────────────────────
+    "partial_exit_pct": 0.008,           # +0.8% → sell 50%
+    "partial_trailing_stop_pct": -0.003, # tighter trailing for remainder
+    "full_take_profit_pct": 0.020,       # +2.0% → sell everything
+    "take_profit_pct": 0.020,            # alias for full_take_profit_pct
+
+    # ── Time-Based Stop ──────────────────────────────────────────────
+    "time_stop_minutes": 90,
+    "time_stop_min_gain_pct": 0.003,
 
     # ── Daily Risk Limits ─────────────────────────────────────────────
     "max_daily_loss_pct": -0.03,        # -3% daily loss → halt trading
@@ -514,6 +532,11 @@ class IntradayRiskManager(RiskManager):
     Extended risk manager for intraday (day) trading.
 
     Adds on top of the base RiskManager:
+      - ATR-based dynamic stop-loss (adapts to each stock's volatility)
+      - Scaling exits: partial exit at +0.8%, full take-profit at +2.0%
+      - Time-based stop: close stale positions after 90 minutes
+      - Smart position sizing for small accounts (<$500)
+      - Position reconciliation (wallet vs Alpaca)
       - Per-trade take-profit and trailing stop-loss
       - Daily loss limit (halt trading if exceeded)
       - Daily trade counter (prevent overtrading)
@@ -534,10 +557,16 @@ class IntradayRiskManager(RiskManager):
         self.start_of_day_equity = 0.0
 
         log.info(f"  ⚡ Intraday Risk Manager initialized")
-        log.info(f"     Stop-loss:     {self.config['stop_loss_pct']*100:.1f}%")
-        log.info(f"     Take-profit:   {self.config['take_profit_pct']*100:.1f}%")
+        log.info(f"     ATR multiplier: {self.config.get('stop_loss_atr_multiplier', 1.5)}x")
+        log.info(f"     Stop fallback:  {self.config.get('stop_loss_fallback_pct', -0.012)*100:.1f}%")
+        log.info(f"     Partial exit:   +{self.config.get('partial_exit_pct', 0.008)*100:.1f}%")
+        log.info(f"     Full TP:        +{self.config.get('full_take_profit_pct', 0.020)*100:.1f}%")
+        log.info(f"     Time stop:      {self.config.get('time_stop_minutes', 90)} min")
         log.info(f"     Daily loss cap: {self.config['max_daily_loss_pct']*100:.1f}%")
         log.info(f"     Max trades/day: {self.config['max_daily_trades']}")
+
+        # Save config on init so the Gradio dashboard can read it
+        self.save_config()
 
     def reset_daily(self, equity):
         """Call at market open to reset daily counters."""
@@ -549,23 +578,79 @@ class IntradayRiskManager(RiskManager):
         log.info(f"  🌅 Daily risk counters reset. SOD equity: ${equity:.2f}")
 
     # ═══════════════════════════════════════════════════════════════════
-    # Per-Trade Exit Signals
+    # ATR-Based Dynamic Stop-Loss Calculation
     # ═══════════════════════════════════════════════════════════════════
-    def check_intraday_exits(self, positions, get_price_fn):
+    def _compute_atr_stop_pct(self, entry_price, atr_value):
         """
-        Check all positions for intraday exit signals:
-          1. Hard stop-loss (-0.8%)
-          2. Take-profit (+1.5%)
-          3. Trailing stop (-0.5% from peak, after +0.5% gain)
+        Compute stop-loss percentage from ATR for a given stock.
 
-        Returns: list of (ticker, exit_reason) that should be closed.
+        stop_price = entry_price - (multiplier × ATR)
+        stop_pct   = (stop_price - entry_price) / entry_price
+                   = -(multiplier × ATR) / entry_price
+
+        The result is clamped between stop_loss_min_pct (-2.5%)
+        and stop_loss_max_pct (-0.5%) to prevent absurd values.
+
+        Args:
+            entry_price: price at which the position was opened
+            atr_value:   Average True Range value for the stock
+
+        Returns:
+            float: negative stop-loss percentage (e.g. -0.015 for -1.5%)
         """
-        sl_pct = self.config["stop_loss_pct"]
-        tp_pct = self.config["take_profit_pct"]
+        multiplier = self.config.get("stop_loss_atr_multiplier", 1.5)
+        min_pct = self.config.get("stop_loss_min_pct", -0.025)   # floor: -2.5%
+        max_pct = self.config.get("stop_loss_max_pct", -0.005)   # ceiling: -0.5%
+
+        if entry_price <= 0 or atr_value <= 0:
+            return self.config.get("stop_loss_fallback_pct", -0.012)
+
+        raw_stop_pct = -(multiplier * atr_value) / entry_price
+
+        # Clamp: min_pct is more negative (wider), max_pct is less negative (tighter)
+        # e.g. clamp between -0.025 and -0.005
+        clamped = max(min_pct, min(max_pct, raw_stop_pct))
+        return clamped
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Per-Trade Exit Signals (ATR stops + Scaling exits + Time stop)
+    # ═══════════════════════════════════════════════════════════════════
+    def check_intraday_exits(self, positions, get_price_fn, atr_values=None):
+        """
+        Check all positions for intraday exit signals with ATR-based
+        dynamic stops, scaling exits, and time-based stops.
+
+        Exit types returned:
+          - 'stop_loss'     : price fell below ATR-based (or fallback) stop
+          - 'partial_exit'  : price gained +0.8% → caller should sell 50%
+          - 'trailing_stop' : remainder dropped from peak after partial exit
+          - 'take_profit'   : full take-profit at +2.0%
+          - 'time_stop'     : position stale for 90+ min with <0.3% gain
+
+        Args:
+            positions:    list of position dicts with 'ticker', 'entry_price',
+                          and optionally 'peak_price', 'entry_time',
+                          'partial_exited' (bool)
+            get_price_fn: callable(ticker) → current_price or None
+            atr_values:   optional dict {ticker: ATR_value} for dynamic stops
+
+        Returns:
+            list of (ticker, exit_reason) that should be closed.
+        """
+        atr_values = atr_values or {}
+
+        # Config values
+        fallback_stop = self.config.get("stop_loss_fallback_pct", -0.012)
         trail_pct = self.config.get("trailing_stop_pct", -0.005)
         trail_act = self.config.get("trailing_activation_pct", 0.005)
+        partial_exit_pct = self.config.get("partial_exit_pct", 0.008)
+        partial_trail_pct = self.config.get("partial_trailing_stop_pct", -0.003)
+        full_tp_pct = self.config.get("full_take_profit_pct", 0.020)
+        time_stop_min = self.config.get("time_stop_minutes", 90)
+        time_stop_gain = self.config.get("time_stop_min_gain_pct", 0.003)
 
         exits = []
+        now = datetime.now(ZoneInfo("America/New_York"))
 
         for pos in positions:
             ticker = pos["ticker"]
@@ -581,29 +666,100 @@ class IntradayRiskManager(RiskManager):
             peak = max(peak, current_price)
             pos["peak_price"] = peak
 
-            # 1. Hard stop-loss
+            already_partial = pos.get("partial_exited", False)
+
+            # ── 1. ATR-based dynamic stop-loss ────────────────────────
+            if ticker in atr_values and atr_values[ticker] > 0:
+                sl_pct = self._compute_atr_stop_pct(entry_price, atr_values[ticker])
+                log.debug(
+                    f"  📐 {ticker}: ATR stop = {sl_pct*100:+.2f}% "
+                    f"(ATR={atr_values[ticker]:.4f}, entry=${entry_price:.2f})"
+                )
+            else:
+                sl_pct = fallback_stop
+                log.debug(
+                    f"  📐 {ticker}: Using fallback stop = {sl_pct*100:+.2f}% "
+                    f"(no ATR available)"
+                )
+
             if pnl_pct <= sl_pct:
-                log.warning(f"  🛑 STOP-LOSS {ticker}: {pnl_pct*100:+.2f}% "
-                           f"(limit: {sl_pct*100:.1f}%)")
+                log.warning(
+                    f"  🛑 STOP-LOSS {ticker}: {pnl_pct*100:+.2f}% "
+                    f"(dynamic limit: {sl_pct*100:.2f}%)"
+                )
                 exits.append((ticker, "stop_loss"))
                 continue
 
-            # 2. Take-profit
-            if pnl_pct >= tp_pct:
-                log.info(f"  🎯 TAKE-PROFIT {ticker}: {pnl_pct*100:+.2f}% "
-                        f"(target: {tp_pct*100:.1f}%)")
+            # ── 2. Full take-profit at +2.0% ─────────────────────────
+            if pnl_pct >= full_tp_pct:
+                log.info(
+                    f"  🎯 FULL TAKE-PROFIT {ticker}: {pnl_pct*100:+.2f}% "
+                    f"(target: +{full_tp_pct*100:.1f}%)"
+                )
                 exits.append((ticker, "take_profit"))
                 continue
 
-            # 3. Trailing stop (only after activation threshold)
-            gain_from_entry = (peak - entry_price) / entry_price
-            if gain_from_entry >= trail_act:
+            # ── 3. Scaling exit: partial at +0.8% ────────────────────
+            if not already_partial and pnl_pct >= partial_exit_pct:
+                log.info(
+                    f"  📊 PARTIAL EXIT {ticker}: {pnl_pct*100:+.2f}% "
+                    f"(threshold: +{partial_exit_pct*100:.1f}%) — sell 50%"
+                )
+                pos["partial_exited"] = True
+                exits.append((ticker, "partial_exit"))
+                continue
+
+            # ── 4. Tighter trailing stop after partial exit ──────────
+            if already_partial:
                 dd_from_peak = (current_price - peak) / peak
-                if dd_from_peak <= trail_pct:
-                    log.info(f"  📉 TRAILING STOP {ticker}: "
-                            f"peak gain {gain_from_entry*100:+.1f}% → "
-                            f"now {pnl_pct*100:+.1f}%")
+                if dd_from_peak <= partial_trail_pct:
+                    log.info(
+                        f"  📉 PARTIAL TRAILING STOP {ticker}: "
+                        f"peak gain → now {pnl_pct*100:+.2f}%, "
+                        f"dd from peak {dd_from_peak*100:+.2f}% "
+                        f"(limit: {partial_trail_pct*100:.1f}%)"
+                    )
                     exits.append((ticker, "trailing_stop"))
+                    continue
+
+            # ── 5. Normal trailing stop (before partial exit) ────────
+            if not already_partial:
+                gain_from_entry = (peak - entry_price) / entry_price
+                if gain_from_entry >= trail_act:
+                    dd_from_peak = (current_price - peak) / peak
+                    if dd_from_peak <= trail_pct:
+                        log.info(
+                            f"  📉 TRAILING STOP {ticker}: "
+                            f"peak gain {gain_from_entry*100:+.1f}% → "
+                            f"now {pnl_pct*100:+.1f}%"
+                        )
+                        exits.append((ticker, "trailing_stop"))
+                        continue
+
+            # ── 6. Time-based stop ───────────────────────────────────
+            entry_time = pos.get("entry_time")
+            if entry_time is not None:
+                # Parse entry_time if it's a string
+                if isinstance(entry_time, str):
+                    try:
+                        entry_time = datetime.fromisoformat(entry_time)
+                    except (ValueError, TypeError):
+                        log.debug(f"  ⏰ {ticker}: Could not parse entry_time '{entry_time}'")
+                        continue
+
+                # Ensure timezone-aware
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=ZoneInfo("America/New_York"))
+
+                elapsed_minutes = (now - entry_time).total_seconds() / 60.0
+
+                if elapsed_minutes >= time_stop_min and pnl_pct < time_stop_gain:
+                    log.info(
+                        f"  ⏰ TIME STOP {ticker}: {elapsed_minutes:.0f} min elapsed, "
+                        f"gain {pnl_pct*100:+.2f}% < +{time_stop_gain*100:.1f}% threshold"
+                    )
+                    exits.append((ticker, "time_stop"))
+                    continue
 
         return exits
 
@@ -661,7 +817,7 @@ class IntradayRiskManager(RiskManager):
         return not self.daily_halted
 
     # ═══════════════════════════════════════════════════════════════════
-    # Cost-Aware Position Sizing
+    # Cost-Aware Position Sizing (Original)
     # ═══════════════════════════════════════════════════════════════════
     def calculate_position_size(self, equity, entry_price, stop_price,
                                 spread_pct=0.0003):
@@ -696,6 +852,236 @@ class IntradayRiskManager(RiskManager):
 
         # Floor at $1 (Alpaca minimum)
         return max(1.0, round(dollar_amount, 2))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Smart Position Sizing v2 (Account-Size Aware + ATR)
+    # ═══════════════════════════════════════════════════════════════════
+    def calculate_position_size_v2(self, equity, entry_price, atr, spread_pct=0.0003):
+        """
+        Smart position sizing based on account size and ATR.
+
+        Adapts risk parameters and max positions to account size:
+          - Small  (<$500):   2% risk per trade, max 5 positions
+          - Medium ($500–$5k): 1.5% risk per trade, max 8 positions
+          - Large  (>$5k):    1% risk per trade, max 12 positions
+
+        Uses ATR to compute stop distance, then sizes the position so that
+        hitting the stop would cost exactly (risk_pct × equity).
+
+        Also enforces a $15 minimum position size (so profits remain
+        meaningful after spread costs on small accounts).
+
+        Args:
+            equity:     current portfolio equity
+            entry_price: expected entry price of the stock
+            atr:        Average True Range value for the stock
+            spread_pct: estimated bid-ask spread as a fraction (default 0.03%)
+
+        Returns:
+            dict with keys:
+              - 'dollar_amount': float, how much to invest
+              - 'max_positions': int, max concurrent positions for this equity
+              - 'risk_pct': float, risk percentage used
+              - 'stop_pct': float, the ATR-based stop percentage applied
+        """
+        # ── Tier the account ─────────────────────────────────────────
+        if equity < 500:
+            risk_pct = 0.02     # 2% risk for small accounts
+            max_positions = 5
+            tier = "small"
+        elif equity < 5000:
+            risk_pct = 0.015    # 1.5% risk for medium accounts
+            max_positions = 8
+            tier = "medium"
+        else:
+            risk_pct = 0.01     # 1% risk for large accounts
+            max_positions = 12
+            tier = "large"
+
+        log.info(
+            f"  💰 Position sizing v2: equity=${equity:.2f} → {tier} account "
+            f"(risk={risk_pct*100:.1f}%, max_pos={max_positions})"
+        )
+
+        if entry_price <= 0:
+            log.warning("  ⚠️ Invalid entry_price for position sizing")
+            return {
+                "dollar_amount": 0.0,
+                "max_positions": max_positions,
+                "risk_pct": risk_pct,
+                "stop_pct": 0.0,
+            }
+
+        # ── Compute ATR-based stop distance ──────────────────────────
+        if atr > 0:
+            stop_pct = self._compute_atr_stop_pct(entry_price, atr)
+        else:
+            stop_pct = self.config.get("stop_loss_fallback_pct", -0.012)
+
+        stop_distance = abs(stop_pct) * entry_price  # dollar distance to stop
+
+        # ── Account for costs ────────────────────────────────────────
+        spread_cost = entry_price * spread_pct * 2   # round-trip spread
+        slippage = entry_price * 0.0002              # 0.02% slippage estimate
+        total_risk_per_share = stop_distance + spread_cost + slippage
+
+        if total_risk_per_share <= 0:
+            log.warning(f"  ⚠️ Zero risk per share — cannot size position")
+            return {
+                "dollar_amount": 0.0,
+                "max_positions": max_positions,
+                "risk_pct": risk_pct,
+                "stop_pct": stop_pct,
+            }
+
+        # ── Size the position ────────────────────────────────────────
+        risk_amount = equity * risk_pct              # e.g., $100 * 2% = $2
+        shares = risk_amount / total_risk_per_share
+        dollar_amount = shares * entry_price
+
+        # Cap at (equity / max_positions) so we don't overconcentrate
+        max_dollar_per_pos = equity / max_positions
+        dollar_amount = min(dollar_amount, max_dollar_per_pos)
+
+        # Also cap at the general max_position_pct
+        max_pos_pct = self.config.get("max_position_pct", 0.15)
+        dollar_amount = min(dollar_amount, equity * max_pos_pct)
+
+        # Enforce $15 minimum for small accounts (to make profits meaningful)
+        min_position = 15.0
+        if dollar_amount < min_position:
+            if equity >= min_position:
+                dollar_amount = min_position
+                log.info(
+                    f"  📏 Position size floored to ${min_position:.0f} minimum"
+                )
+            else:
+                # Account too small even for minimum — use whatever we have
+                dollar_amount = max(1.0, equity * 0.5)
+                log.warning(
+                    f"  ⚠️ Account too small for ${min_position:.0f} minimum, "
+                    f"using ${dollar_amount:.2f}"
+                )
+
+        dollar_amount = round(dollar_amount, 2)
+
+        log.info(
+            f"  📏 Position size: ${dollar_amount:.2f} "
+            f"(risk=${risk_amount:.2f}, stop={stop_pct*100:+.2f}%, "
+            f"ATR=${atr:.4f})"
+        )
+
+        return {
+            "dollar_amount": dollar_amount,
+            "max_positions": max_positions,
+            "risk_pct": risk_pct,
+            "stop_pct": stop_pct,
+        }
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Position Reconciliation (Wallet vs Alpaca)
+    # ═══════════════════════════════════════════════════════════════════
+    def reconcile_positions(self, wallet_positions, alpaca_positions):
+        """
+        Compare wallet state with actual Alpaca positions.
+
+        This catches dangerous discrepancies that can happen when:
+          - A sell order filled but the wallet wasn't updated
+          - The bot crashed mid-trade
+          - Manual trades were placed on Alpaca
+          - Network errors caused missed order confirmations
+
+        Args:
+            wallet_positions: list of dicts from the bot's wallet, each with
+                              at least {'ticker': str, 'shares': float}
+            alpaca_positions: list of dicts from Alpaca API, each with
+                              at least {'ticker': str, 'shares': float}
+                              (or 'qty' as an alias for 'shares')
+
+        Returns:
+            dict with keys:
+              - 'orphaned_wallet': list of tickers in wallet but NOT in Alpaca
+                                   (phantom positions — we think we own them
+                                    but Alpaca says we don't)
+              - 'orphaned_alpaca': list of tickers in Alpaca but NOT in wallet
+                                   (ghost positions — Alpaca has them but our
+                                    bot doesn't know about them)
+              - 'quantity_mismatch': list of dicts with
+                                     {'ticker', 'wallet_shares', 'alpaca_shares'}
+                                     where both sides have the position but
+                                     the share count differs
+              - 'matched': list of tickers that match perfectly
+        """
+        # Build lookup dicts: ticker → shares
+        wallet_map = {}
+        for pos in wallet_positions:
+            ticker = pos.get("ticker", pos.get("symbol", ""))
+            shares = float(pos.get("shares", pos.get("qty", 0)))
+            if ticker:
+                wallet_map[ticker] = shares
+
+        alpaca_map = {}
+        for pos in alpaca_positions:
+            ticker = pos.get("ticker", pos.get("symbol", ""))
+            shares = float(pos.get("shares", pos.get("qty", 0)))
+            if ticker:
+                alpaca_map[ticker] = shares
+
+        wallet_tickers = set(wallet_map.keys())
+        alpaca_tickers = set(alpaca_map.keys())
+
+        # Tickers only in wallet (phantom)
+        orphaned_wallet = sorted(wallet_tickers - alpaca_tickers)
+        # Tickers only in Alpaca (ghost)
+        orphaned_alpaca = sorted(alpaca_tickers - wallet_tickers)
+        # Tickers in both
+        common = wallet_tickers & alpaca_tickers
+
+        matched = []
+        quantity_mismatch = []
+
+        for ticker in sorted(common):
+            w_shares = wallet_map[ticker]
+            a_shares = alpaca_map[ticker]
+            # Allow tiny float differences (< 0.001 share)
+            if abs(w_shares - a_shares) < 0.001:
+                matched.append(ticker)
+            else:
+                quantity_mismatch.append({
+                    "ticker": ticker,
+                    "wallet_shares": w_shares,
+                    "alpaca_shares": a_shares,
+                })
+
+        # Log results
+        if orphaned_wallet:
+            log.warning(
+                f"  ⚠️ RECONCILIATION: {len(orphaned_wallet)} phantom positions "
+                f"(in wallet, not in Alpaca): {orphaned_wallet}"
+            )
+        if orphaned_alpaca:
+            log.warning(
+                f"  ⚠️ RECONCILIATION: {len(orphaned_alpaca)} ghost positions "
+                f"(in Alpaca, not in wallet): {orphaned_alpaca}"
+            )
+        if quantity_mismatch:
+            for m in quantity_mismatch:
+                log.warning(
+                    f"  ⚠️ RECONCILIATION: {m['ticker']} qty mismatch — "
+                    f"wallet={m['wallet_shares']:.4f}, "
+                    f"alpaca={m['alpaca_shares']:.4f}"
+                )
+        if not orphaned_wallet and not orphaned_alpaca and not quantity_mismatch:
+            log.info(
+                f"  ✅ RECONCILIATION: All {len(matched)} positions match perfectly"
+            )
+
+        return {
+            "orphaned_wallet": orphaned_wallet,
+            "orphaned_alpaca": orphaned_alpaca,
+            "quantity_mismatch": quantity_mismatch,
+            "matched": matched,
+        }
 
     # ═══════════════════════════════════════════════════════════════════
     # Spread & Cost Guard
@@ -751,4 +1137,3 @@ if __name__ == "__main__":
     print(f"\n📋 Intraday config:")
     for k, v in INTRADAY_CONFIG.items():
         print(f"   {k}: {v}")
-

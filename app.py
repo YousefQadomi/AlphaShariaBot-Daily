@@ -1,11 +1,11 @@
 """
-app.py — AlphaShariaBot Cloud Scheduler + Dashboard (Day Trading Mode)
-=======================================================================
+app.py — AlphaShariaBot Cloud Scheduler + Dashboard (Day Trading V2)
+=====================================================================
 Runs on Hugging Face Spaces (Gradio).
-- Intraday trading:   Every 5 min during market hours (9:35 AM — 3:50 PM ET)
-- News polling:       Every 15 min during market hours
-- Force-close:        At 3:50 PM ET
-- Dashboard:          Shows live wallet, trades, risk health, intraday stats
+- Intraday trading: Adaptive scan intervals (60s opening, 5min normal, 10min midday)
+- News polling:     Every 15 min during market hours
+- Force-close:      At 3:50 PM ET
+- Dashboard:        Shows live wallet, trades, risk health, intraday stats
 """
 
 import os
@@ -26,7 +26,6 @@ import gradio as gr
 # ─── Paths ────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 WALLET_PATH = os.path.join(BASE_DIR, "data", "live", "intraday_wallet.json")
-SWING_WALLET = os.path.join(BASE_DIR, "data", "live", "virtual_wallet.json")
 RISK_CFG    = os.path.join(BASE_DIR, "data", "live", "risk_config.json")
 LOG_PATH    = os.path.join(BASE_DIR, "logs", "alpha_intraday.log")
 SCHED_LOG   = os.path.join(BASE_DIR, "logs", "scheduler.log")
@@ -78,22 +77,18 @@ def run_script(script_name, extra_args=None):
 # ─── Load wallet data for dashboard ──────────────────────────────────────
 def load_wallet():
     """Load and return intraday wallet state as formatted text."""
-    # Try intraday wallet first, fall back to swing wallet
-    wallet_path = WALLET_PATH if os.path.exists(WALLET_PATH) else SWING_WALLET
     try:
-        with open(wallet_path, "r") as f:
+        with open(WALLET_PATH, "r") as f:
             w = json.load(f)
     except FileNotFoundError:
         return "No wallet file found. Run the bot first."
 
-    mode = "INTRADAY" if wallet_path == WALLET_PATH else "SWING"
     lines = []
-    lines.append(f"⚡ Mode: {mode} DAY TRADING")
+    lines.append(f"⚡ Mode: INTRADAY DAY TRADING")
     lines.append(f"💰 Initial Balance:  ${w.get('initial_balance', 0):,.2f}")
     lines.append(f"💵 Cash Available:   ${w.get('cash', 0):,.2f}")
     lines.append(f"📊 Realized PnL:     ${w.get('realized_pnl', 0):+,.2f}")
-    max_pos = 12 if mode == "INTRADAY" else 50
-    lines.append(f"📂 Open Positions:   {len(w.get('positions', []))}/{max_pos}")
+    lines.append(f"📂 Open Positions:   {len(w.get('positions', []))}")
     lines.append(f"📜 Total Trades:     {len(w.get('trade_history', []))}")
     lines.append(f"📅 Last Run:         {w.get('last_run_date', 'Never')}")
 
@@ -165,12 +160,8 @@ def load_risk_config():
 
 def load_logs():
     """Load last 50 lines of the intraday log."""
-    # Try intraday log first, fall back to swing log
-    log_path = LOG_PATH
-    if not os.path.exists(log_path):
-        log_path = os.path.join(BASE_DIR, "logs", "alpha_live.log")
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         return "".join(lines[-50:])
     except FileNotFoundError:
@@ -211,20 +202,35 @@ def get_scheduler_status():
     return "\n".join(lines)
 
 
+# ─── Adaptive Scan Interval ──────────────────────────────────────────────
+def _get_adaptive_interval():
+    """Return scan interval based on market session phase."""
+    now = datetime.now(ZoneInfo("America/New_York"))
+    market_open = now.replace(hour=9, minute=30, second=0)
+    mins = max(0, (now - market_open).total_seconds() / 60)
+    if mins < 30:
+        return 60, "opening"      # first 30 min: every 60s
+    elif mins >= 330:
+        return 120, "power_hour"  # 3:00 PM+: every 2 min
+    elif 120 < mins < 270:
+        return 600, "midday"      # 11:30-2:00: every 10 min
+    else:
+        return 300, "normal"      # default: every 5 min
+
+
 # ─── Background Scheduler ────────────────────────────────────────────────
 def scheduler_loop():
     """
-    Background thread for intraday trading:
-    - Runs alpha_intraday.py scan every 5 minutes during market hours
-    - Runs news polling every 15 minutes
+    Background thread for intraday trading V2:
+    - Adaptive scan intervals (60s opening, 5min normal, 10min midday, 2min power hour)
+    - News polling every 15 minutes
     - Force-closes all at 3:50 PM ET
     """
-    SCAN_INTERVAL = 300  # 5 minutes
     last_scan_time = 0
     last_news_time = 0
     today_date = None
 
-    slog.info("⚡ Intraday scheduler started.")
+    slog.info("⚡ Intraday scheduler V2 started (adaptive intervals).")
 
     while scheduler_status["running"]:
         try:
@@ -244,15 +250,18 @@ def scheduler_loop():
             )
 
             if is_weekday and is_market_hours:
-                # ── Trading scan every 5 minutes ──────────────────────
-                if now_ts - last_scan_time >= SCAN_INTERVAL:
+                scan_interval, phase = _get_adaptive_interval()
+
+                # ── Trading scan (adaptive interval) ──────────────────
+                if now_ts - last_scan_time >= scan_interval:
                     ok, output = run_script("alpha_intraday.py")
                     last_scan_time = now_ts
                     scheduler_status["scan_last_run"] = now.strftime(
                         "%H:%M:%S ET")
-                    next_scan = now + timedelta(seconds=SCAN_INTERVAL)
-                    scheduler_status["scan_next_run"] = next_scan.strftime(
-                        "%H:%M:%S ET")
+                    next_scan = now + timedelta(seconds=scan_interval)
+                    scheduler_status["scan_next_run"] = (
+                        f"{next_scan.strftime('%H:%M:%S ET')} ({phase})"
+                    )
                     scheduler_status["scans_today"] += 1
                     scheduler_status["last_output"] = f"[Scan] {output[-500:]}"
 
@@ -267,8 +276,13 @@ def scheduler_loop():
                     slog.info("🔔 EOD Force-close triggered")
                     run_script("alpha_intraday.py", ["--force-close"])
 
+            # ── Weekly halal screener refresh (Sunday midnight or Monday pre-market)
+            if now.weekday() == 0 and now.hour == 7 and now.minute < 2:
+                slog.info("☪️ Weekly halal universe refresh...")
+                run_script("sharia_screener.py")
+
             # Check less frequently outside market hours
-            sleep_time = 30 if is_market_hours else 60
+            sleep_time = 15 if is_market_hours else 60
             time.sleep(sleep_time)
 
         except Exception as e:
