@@ -93,36 +93,36 @@ DEFAULT_CONFIG = {
 # ═══════════════════════════════════════════════════════════════════════════
 INTRADAY_CONFIG = {
     # ── ATR-Based Dynamic Stop-Loss ──────────────────────────────────
-    "stop_loss_atr_multiplier": 1.5,    # stop = entry - (multiplier * ATR)
+    "stop_loss_atr_multiplier": 2.0,    # stop = entry - (multiplier * ATR)
     "stop_loss_min_pct": -0.025,         # floor: never wider than -2.5%
     "stop_loss_max_pct": -0.005,         # ceiling: never tighter than -0.5%
-    "stop_loss_fallback_pct": -0.012,    # used when ATR unavailable (-1.2%)
+    "stop_loss_fallback_pct": -0.018,    # used when ATR unavailable (-1.8%)
 
     # ── Legacy stop (kept for config completeness) ───────────────────
-    "stop_loss_pct": -0.012,            # matches fallback; used by base class
+    "stop_loss_pct": -0.018,            # matches fallback; used by base class
 
     # ── Trailing Stop ────────────────────────────────────────────────
-    "trailing_stop_pct": -0.005,        # -0.5% trailing after activation
-    "trailing_activation_pct": 0.005,   # activate trailing after +0.5%
+    "trailing_stop_pct": -0.008,        # -0.8% trailing after activation
+    "trailing_activation_pct": 0.012,   # activate trailing after +1.2%
 
     # ── Scaling Exits ────────────────────────────────────────────────
-    "partial_exit_pct": 0.008,           # +0.8% → sell 50%
-    "partial_trailing_stop_pct": -0.003, # tighter trailing for remainder
-    "full_take_profit_pct": 0.020,       # +2.0% → sell everything
-    "take_profit_pct": 0.020,            # alias for full_take_profit_pct
+    "partial_exit_pct": 0.015,           # +1.5% → sell 50%
+    "partial_trailing_stop_pct": -0.005, # tighter trailing for remainder
+    "full_take_profit_pct": 0.050,       # +5.0% → sell everything
+    "take_profit_pct": 0.050,            # alias for full_take_profit_pct
 
     # ── Time-Based Stop ──────────────────────────────────────────────
-    "time_stop_minutes": 90,
-    "time_stop_min_gain_pct": 0.003,
+    "time_stop_minutes": 45,
+    "time_stop_min_gain_pct": 0.004,
 
     # ── Daily Risk Limits ─────────────────────────────────────────────
     "max_daily_loss_pct": -0.03,        # -3% daily loss → halt trading
     "max_daily_trades": 30,             # cap trades per day
-    "max_consecutive_losses": 5,        # 5 losses in a row → pause
+    "max_consecutive_losses": 3,        # 3 losses in a row → pause
 
     # ── Position Sizing ───────────────────────────────────────────────
-    "risk_per_trade_pct": 0.01,         # risk 1% of equity per trade
-    "max_position_pct": 0.15,           # max 15% of equity in one stock
+    "risk_per_trade_pct": 0.03,         # risk 3% of equity per trade
+    "max_position_pct": 0.40,           # max 40% of equity in one stock
     "max_sector_exposure": 0.40,        # max 40% in one sector
 
     # ── Volatility Sizing ─────────────────────────────────────────────
@@ -886,16 +886,16 @@ class IntradayRiskManager(RiskManager):
         """
         # ── Tier the account ─────────────────────────────────────────
         if equity < 500:
-            risk_pct = 0.02     # 2% risk for small accounts
-            max_positions = 5
+            risk_pct = 0.03     # 3% risk for small accounts
+            max_positions = 3
             tier = "small"
         elif equity < 5000:
-            risk_pct = 0.015    # 1.5% risk for medium accounts
-            max_positions = 8
+            risk_pct = 0.025    # 2.5% risk for medium accounts
+            max_positions = 3
             tier = "medium"
         else:
-            risk_pct = 0.01     # 1% risk for large accounts
-            max_positions = 12
+            risk_pct = 0.015    # 1.5% risk for large accounts
+            max_positions = 5
             tier = "large"
 
         log.info(
@@ -939,8 +939,8 @@ class IntradayRiskManager(RiskManager):
         shares = risk_amount / total_risk_per_share
         dollar_amount = shares * entry_price
 
-        # Cap at (equity / max_positions) so we don't overconcentrate
-        max_dollar_per_pos = equity / max_positions
+        # Cap at (equity / max_positions) * 1.5 so we can concentrate more
+        max_dollar_per_pos = (equity / max_positions) * 1.5
         dollar_amount = min(dollar_amount, max_dollar_per_pos)
 
         # Also cap at the general max_position_pct
@@ -948,7 +948,7 @@ class IntradayRiskManager(RiskManager):
         dollar_amount = min(dollar_amount, equity * max_pos_pct)
 
         # Enforce $15 minimum for small accounts (to make profits meaningful)
-        min_position = 15.0
+        min_position = 50.0
         if dollar_amount < min_position:
             if equity >= min_position:
                 dollar_amount = min_position

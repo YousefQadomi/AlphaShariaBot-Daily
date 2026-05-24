@@ -13,6 +13,9 @@ data/sentiment/
 data/macro/
 data/backtest/
 
+# Live trading state (preserved across deploys)
+data/live/
+
 # Pickle/model binaries (too large)
 models/*.pkl
 models/*.pth

@@ -66,7 +66,7 @@ ET             = ZoneInfo("America/New_York")
 
 # ─── Strategy Constants ───────────────────────────────────────────────────
 INITIAL_BALANCE     = 1000.0
-MIN_ENTRY_SCORE     = 45.0      # lowered from 50 — smarter scoring is more calibrated
+MIN_ENTRY_SCORE     = 55.0      # raised — require higher conviction entries
 MARKET_OPEN_HOUR    = 9
 MARKET_OPEN_MIN     = 35        # start 5 min after open (skip noise)
 FORCE_CLOSE_HOUR    = 15
@@ -615,6 +615,16 @@ def run_scan_cycle(alpaca, wallet, risk_mgr, feature_engine, news_fetcher,
             skipped_features += 1
             continue
 
+        # Skip low-ATR stocks (not enough movement to profit)
+        if features.get("atr_pct", 0) < 0.015:
+            skipped_features += 1
+            continue
+
+        # Skip low-volume stocks (need unusual activity)
+        if features.get("relative_volume", 0) < 1.2:
+            skipped_features += 1
+            continue
+
         scanned += 1
 
         # Get catalyst score from news
@@ -630,7 +640,7 @@ def run_scan_cycle(alpaca, wallet, risk_mgr, feature_engine, news_fetcher,
                               dtype=np.float32)
                 ml_prob = float(intraday_model.predict(fv)[0])
                 # Blend: 60% rule-based + 40% ML (scaled to 0-100)
-                score = round(score * 0.6 + ml_prob * 100 * 0.4, 1)
+                score = round(score * 0.5 + ml_prob * 100 * 0.5, 1)
             except Exception:
                 pass  # fall back to rule-based score
 

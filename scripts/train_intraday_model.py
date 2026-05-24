@@ -86,9 +86,9 @@ N_OPTUNA_TRIALS = 20
 
 # Target thresholds
 TARGET_CONFIGS = {
-    "target_30m": {"forward_bars": 6,  "min_gain": 0.005},
-    "target_1h":  {"forward_bars": 12, "min_gain": 0.008},
-    "target_2h":  {"forward_bars": 24, "min_gain": 0.010},
+    "target_30m": {"forward_bars": 6,  "min_gain": 0.010},
+    "target_1h":  {"forward_bars": 12, "min_gain": 0.015},
+    "target_2h":  {"forward_bars": 24, "min_gain": 0.020},
 }
 
 # Which target to train on (primary)
