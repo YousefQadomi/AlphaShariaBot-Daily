@@ -49,7 +49,7 @@ class IntradayFeatureEngine:
             try:
                 url = (f"{self.alpaca.DATA_URL}/v2/stocks/{ticker}/bars"
                        f"?timeframe=5Min&start={start_str}&end={end_str}"
-                       f"&limit=10000&feed=iex&adjustment=raw")
+                       f"&limit=10000&feed=sip&adjustment=raw")
                 data = self.alpaca._get(url)
                 bars = data.get("bars", [])
                 if not bars:

@@ -315,7 +315,7 @@ class AlpacaIntradayClient:
 
     def get_latest_price(self, ticker):
         try:
-            r = self._get(f"{self.DATA_URL}/v2/stocks/{ticker}/trades/latest?feed=iex")
+            r = self._get(f"{self.DATA_URL}/v2/stocks/{ticker}/trades/latest?feed=sip")
             return float(r["trade"]["p"])
         except Exception as e:
             log.warning(f"  ⚠️ Price failed for {ticker}: {e}")
@@ -324,7 +324,7 @@ class AlpacaIntradayClient:
     def get_latest_quote(self, ticker):
         """Get latest bid/ask quote for spread checking."""
         try:
-            r = self._get(f"{self.DATA_URL}/v2/stocks/{ticker}/quotes/latest?feed=iex")
+            r = self._get(f"{self.DATA_URL}/v2/stocks/{ticker}/quotes/latest?feed=sip")
             quote = r.get("quote", {})
             return {
                 "bid": float(quote.get("bp", 0)),

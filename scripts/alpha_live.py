@@ -262,7 +262,7 @@ class AlpacaClient:
     # ── Prices ────────────────────────────────────────────────────────
     def get_latest_price(self, ticker):
         try:
-            r = self._get(f"{self.DATA_URL}/v2/stocks/{ticker}/trades/latest?feed=iex")
+            r = self._get(f"{self.DATA_URL}/v2/stocks/{ticker}/trades/latest?feed=sip")
             return float(r["trade"]["p"])
         except Exception as e:
             log.warning(f"  ⚠️ Price fetch failed for {ticker}: {e}")
@@ -271,7 +271,7 @@ class AlpacaClient:
     def get_bars(self, ticker, start, end, timeframe="1Day"):
         """Fetch OHLCV bars from Alpaca Data API (IEX free feed)."""
         url = (f"{self.DATA_URL}/v2/stocks/{ticker}/bars"
-               f"?timeframe={timeframe}&start={start}&end={end}&limit=10000&feed=iex")
+               f"?timeframe={timeframe}&start={start}&end={end}&limit=10000&feed=sip")
         try:
             data = self._get(url)
             bars = data.get("bars", [])
