@@ -452,17 +452,29 @@ def scheduler_loop():
 
 # ─── Engine Start / Stop ─────────────────────────────────────────────────
 def toggle_engine():
-    global _scheduler_thread
+    global _scheduler_thread, news_swarm_process
     if scheduler_status["running"]:
         scheduler_status["running"] = False
-        slog.info("⛔ Engine STOP requested by user.")
-        return "⛔ Engine STOPPED."
+        if news_swarm_process is not None:
+            news_swarm_process.terminate()
+            news_swarm_process = None
+            slog.info("🔪 Quant News Swarm Daemon TERMINATED.")
+        slog.info("🔴 Engine STOP requested by user.")
+        return "🔴 Engine STOPPED."
     else:
         scheduler_status["running"] = True
         _scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
         _scheduler_thread.start()
-        slog.info("✅ Engine STARTED by user.")
-        return "✅ Engine STARTED! Scanning automatically."
+        
+        if news_swarm_process is None or news_swarm_process.poll() is not None:
+            news_swarm_process = subprocess.Popen(
+                [sys.executable, os.path.join(BASE_DIR, "scripts", "quant_news_agent.py")],
+                cwd=BASE_DIR
+            )
+            slog.info("🐝 Quant News Swarm Daemon STARTED in background.")
+            
+        slog.info("🟢 Engine STARTED by user.")
+        return "🟢 Engine STARTED! Scanning automatically."
 
 # ─── Manual Trigger Functions ────────────────────────────────────────────
 def manual_run_scan():
