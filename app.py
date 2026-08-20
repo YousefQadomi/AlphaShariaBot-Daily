@@ -308,6 +308,19 @@ def get_scheduler_html():
         <div class="stat-box"><div class="label">Last Scan</div><div class="value" style="font-size:14px">{s["scan_last_run"]}</div></div>
         <div class="stat-box"><div class="label">Next Scan</div><div class="value" style="font-size:14px">{s["scan_next_run"]}</div></div>
         <div class="stat-box"><div class="label">Scans Today</div><div class="value">{s["scans_today"]}</div></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:12px; background: rgba(30, 41, 59, 0.8);">
+      <h3 style="color:#a855f7;">🧠 Swarm Neural Link</h3>
+      <div class="stat-grid">
+        <div class="stat-box">
+          <div class="label">Intelligence Swarm</div>
+          <div class="value">{ '<span style="color:#00d4aa">🟢 ONLINE (16 Agents)</span>' if news_swarm_process and news_swarm_process.poll() is None else '<span style="color:#ff4757">🔴 OFFLINE</span>' }</div>
+        </div>
+        <div class="stat-box">
+          <div class="label">IPC Signal Bridge</div>
+          <div class="value">{ '<span style="color:#00d4aa">🔗 ACTIVE</span>' if os.path.exists(os.path.join(BASE_DIR, "data", "live", "gemini_reports.json")) else '<span style="color:#f59e0b">⏳ WAITING...</span>' }</div>
+        </div>
         <div class="stat-box"><div class="label">News Poll</div><div class="value" style="font-size:14px">{s["news_last_run"]}</div></div>
       </div>
     </div>
