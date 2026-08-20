@@ -466,6 +466,43 @@ def manual_run_sentiment():
     ok, output = run_script("realtime_news.py")
     return output[-2000:]
 
+def manual_run_gemini():
+    ok, output = run_script("market_observer_gemini.py")
+    return output[-2000:]
+
+# ─── Gemini AI Reports HTML ──────────────────────────────────────────────
+def load_gemini_reports_html():
+    reports_file = os.path.join(BASE_DIR, "data", "live", "gemini_reports.json")
+    try:
+        with open(reports_file, "r", encoding="utf-8") as f:
+            reports = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return CSS + '<div class="card"><h3>🤖 AI Market Reports</h3><p style="color:#667">No reports generated yet. Run the AI Observer to scan the market.</p></div>'
+
+    html = CSS + '<div class="card"><h3>🤖 Live AI Market Intelligence</h3>'
+    if not reports:
+        return html + '<p style="color:#667">No recent actionable news found.</p></div>'
+
+    html += '<table class="pos-table" style="direction:rtl; text-align:right;"><thead><tr>'
+    html += '<th>الرمز</th><th>التقييم</th><th>الخطورة</th><th>الملخص (Gemini)</th><th>التاريخ</th>'
+    html += '</tr></thead><tbody>'
+
+    for r in reversed(reports):
+        score = r.get("sentiment_score", 0)
+        score_cls = 'pnl-pos' if score > 0 else ('pnl-neg' if score < 0 else '')
+        risk = r.get("risk_level", "متوسط")
+        risk_color = "red" if "عال" in risk else ("green" if "منخفض" in risk else "yellow")
+        html += f'''<tr>
+          <td style="direction:ltr; text-align:left;"><strong>{", ".join(r.get("symbols", []))}</strong></td>
+          <td class="{score_cls}" style="direction:ltr; text-align:left;">{score:+.2f}</td>
+          <td style="color:{risk_color}">{risk}</td>
+          <td>{r.get("summary", "")}</td>
+          <td style="direction:ltr; text-align:left;"><small>{r.get("timestamp", "").split("T")[0]}</small></td>
+        </tr>'''
+
+    html += '</tbody></table></div>'
+    return html
+
 # ─── Gradio Dashboard ────────────────────────────────────────────────────
 def build_dashboard():
     custom_css = """
@@ -498,6 +535,15 @@ def build_dashboard():
                     load_portfolio_html, outputs=portfolio_html
                 )
 
+            with gr.Tab("🤖 AI News"):
+                ai_html = gr.HTML(
+                    value=load_gemini_reports_html,
+                    every=15,
+                )
+                gr.Button("🔄 Refresh", variant="secondary").click(
+                    load_gemini_reports_html, outputs=ai_html
+                )
+
             with gr.Tab("⏰ Engine"):
                 engine_html = gr.HTML(
                     value=get_scheduler_html,
@@ -518,10 +564,12 @@ def build_dashboard():
                     scan_btn = gr.Button("🔍 Run Scan", variant="primary")
                     close_btn = gr.Button("🔔 Force-Close All", variant="stop")
                     sent_btn = gr.Button("📰 Run News", variant="secondary")
+                    ai_btn = gr.Button("🤖 Run AI Observer", variant="secondary")
                 output_display = gr.Textbox(label="Output", lines=12, interactive=False)
                 scan_btn.click(manual_run_scan, outputs=output_display)
                 close_btn.click(manual_force_close, outputs=output_display)
                 sent_btn.click(manual_run_sentiment, outputs=output_display)
+                ai_btn.click(manual_run_gemini, outputs=output_display)
 
             with gr.Tab("📜 Trade History"):
                 history_html = gr.HTML(
